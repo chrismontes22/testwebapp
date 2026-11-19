@@ -1,6 +1,6 @@
 /* Planet Pulse — live Earth dashboard.
  * Every source used here is public domain or permissively licensed for commercial use.
- * See README.md / DATA_SOURCES.md for details and required attributions. */
+ * See README.md for details and required attributions. */
 
 const d3 = window.d3;
 const topojson = window.topojson;
@@ -19,14 +19,17 @@ const API = {
 
 const REFRESH_MS = 5 * 60 * 1000; // live feeds
 const FX_REFRESH_MS = 60 * 60 * 1000; // ECB rates change once per working day
+const IDLE_BEFORE_ROTATE_MS = 6000;
+const QUAKE_FEEDS = ["2.5_day", "all_day", "4.5_week", "2.5_week", "significant_month"];
+const ZOOM_MIN = 0.7, ZOOM_MAX = 12;
 
 const INDICATORS = [
   { id: "SP.POP.TOTL", label: "Population", fmt: (v) => fmtCompact(v) },
-  { id: "NY.GDP.PCAP.CD", label: "GDP per capita", fmt: (v) => "$" + fmtCompact(v) },
-  { id: "NY.GDP.MKTP.CD", label: "GDP (current US$)", fmt: (v) => "$" + fmtCompact(v) },
+  { id: "NY.GDP.PCAP.CD", label: "GDP per person", fmt: (v) => "$" + fmtCompact(v) },
+  { id: "NY.GDP.MKTP.CD", label: "Economy size (GDP)", fmt: (v) => "$" + fmtCompact(v) },
   { id: "SP.DYN.LE00.IN", label: "Life expectancy", fmt: (v) => v.toFixed(1) + " yrs" },
-  { id: "IT.NET.USER.ZS", label: "Internet users", fmt: (v) => v.toFixed(0) + "%" },
-  { id: "EG.FEC.RNEW.ZS", label: "Renewable energy share", fmt: (v) => v.toFixed(1) + "%" },
+  { id: "IT.NET.USER.ZS", label: "Online", fmt: (v) => v.toFixed(0) + "% of people" },
+  { id: "EG.FEC.RNEW.ZS", label: "Renewable energy", fmt: (v) => v.toFixed(1) + "% of use" },
 ];
 
 // Natural-event categories: fixed hue order (validated for CVD on the dark surface)
@@ -48,46 +51,108 @@ const KP_LEVELS = [
   { min: 7, label: "Severe G3+", color: "#d03b3b" },
 ];
 const kpLevel = (kp) => [...KP_LEVELS].reverse().find((l) => kp >= l.min) ?? KP_LEVELS[0];
+const kpOutlook = (kp) =>
+  kp >= 7 ? "Auroras possible far from the poles"
+  : kp >= 5 ? "Auroras likely at mid-latitudes"
+  : kp >= 4 ? "Auroras possible at high latitudes"
+  : "Calm magnetic field";
 
 // Earthquakes: one-hue sequential ramp by magnitude (+ size).
 const quakeColor = d3.scaleSequential(d3.interpolateRgb("#f7c6bd", "#e0302a")).domain([1, 7]).clamp(true);
 const quakeRadius = (m, z) => Math.max(2.2, Math.pow(1.62, Math.max(m, 0)) * 0.85) * Math.sqrt(z);
+// Plain-language magnitude classes (USGS / Richter descriptors).
+const quakeClass = (m) =>
+  m >= 8 ? "Great" : m >= 7 ? "Major" : m >= 6 ? "Strong" : m >= 5 ? "Moderate" : m >= 4 ? "Light" : m >= 3 ? "Minor" : "Micro";
+
+// Countries offered as one-click suggestions in the empty country panel.
+const TRY_COUNTRIES = [["JPN", "JP"], ["ISL", "IS"], ["CHL", "CL"], ["IDN", "ID"], ["ITA", "IT"], ["NZL", "NZ"]];
+// Common alternative names → ISO alpha-3, for search.
+const ALIASES = {
+  usa: "USA", us: "USA", america: "USA", "united states of america": "USA", uk: "GBR", britain: "GBR",
+  "great britain": "GBR", england: "GBR", scotland: "GBR", wales: "GBR", holland: "NLD", burma: "MMR",
+  "ivory coast": "CIV", swaziland: "SWZ", "czech republic": "CZE", czech: "CZE", russia: "RUS", korea: "KOR",
+  drc: "COD", "east timor": "TLS", "cape verde": "CPV", persia: "IRN", turkey: "TUR", turkiye: "TUR",
+};
+
+// ---------------------------------------------------------------------------
+// Preferences (remembered between visits; storage may be unavailable)
+// ---------------------------------------------------------------------------
+const PREFS_KEY = "planet-pulse:prefs:v1";
+const prefs = (() => {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; }
+})();
+const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+
+// Face the visitor's part of the world on first load, estimated from their time zone.
+const homeLon = Math.max(-180, Math.min(180, (-new Date().getTimezoneOffset() / 60) * 15));
+const DEFAULT_TILT = -20;
+const defaultRotate = (proj) => [-homeLon, proj === "globe" ? DEFAULT_TILT : 0, 0];
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 const state = {
-  proj: "globe",
-  rotate: [-15, -18, 0],
+  proj: prefs.proj === "flat" ? "flat" : "globe",
+  rotate: null,
   zoom: 1,
   panY: 0,
-  quakeFeed: "2.5_day",
+  quakeFeed: QUAKE_FEEDS.includes(prefs.quakeFeed) ? prefs.quakeFeed : "2.5_day",
+  quakeSort: prefs.quakeSort === "mag" ? "mag" : "time",
   quakes: [],
+  quakesLoaded: false,
   events: [],
   kp: [],
-  layers: { quakes: true, events: true, night: true },
-  hiddenCats: new Set(),
-  autoRotate: true,
+  kpLoaded: false,
+  layers: { quakes: true, events: true, night: true, ...(prefs.layers || {}) },
+  hiddenCats: new Set(Array.isArray(prefs.hiddenCats) ? prefs.hiddenCats : []),
+  autoRotate: typeof prefs.autoRotate === "boolean" ? prefs.autoRotate : !reduceMotion,
+  introDismissed: !!prefs.introDismissed,
   lastInteract: 0,
   moving: false,
   selected: null, // country feature
   hovered: null, // country feature
   hoverMarker: null,
+  pinned: null, // { kind: "quake" | "event", id }
+  pointerInside: false,
   fx: { rates: null, names: {}, date: null },
+  fxPref: { from: "USD", to: "EUR", amount: "100", ...(prefs.fx || {}) },
   geo: null,
   codes: {},
   wbCache: new Map(),
   lastRefresh: null,
+  failed: new Set(),
 };
+state.rotate = defaultRotate(state.proj);
+
+function savePrefs() {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({
+      proj: state.proj,
+      quakeFeed: state.quakeFeed,
+      quakeSort: state.quakeSort,
+      layers: state.layers,
+      hiddenCats: [...state.hiddenCats],
+      autoRotate: state.autoRotate,
+      introDismissed: state.introDismissed,
+      fx: state.fxPref,
+    }));
+  } catch { /* private mode or storage blocked: preferences just won't persist */ }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 const $ = (s) => document.querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const icon = (name, cls = "ic") => `<svg class="${cls}" aria-hidden="true"><use href="#i-${name}"/></svg>`;
 const nf = new Intl.NumberFormat();
 const fmtCompact = (v) => new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 2 }).format(v);
+const fmtRate = (v) => new Intl.NumberFormat(undefined, { maximumSignificantDigits: 5 }).format(v);
+const fmtDateTime = (t) =>
+  new Date(t).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 function ago(t) {
   const s = (t - Date.now()) / 1000;
@@ -97,11 +162,20 @@ function ago(t) {
   if (a < 86400) return rtf.format(Math.round(s / 3600), "hour");
   return rtf.format(Math.round(s / 86400), "day");
 }
+const timeTag = (t) => `<time datetime="${new Date(t).toISOString()}" title="${esc(fmtDateTime(t))}">${ago(t)}</time>`;
 const regionNames = (() => {
   try { return new Intl.DisplayNames(undefined, { type: "region" }); } catch { return null; }
 })();
 const flagEmoji = (a2) =>
   a2 && /^[A-Z]{2}$/.test(a2) ? String.fromCodePoint(...[...a2].map((c) => 0x1f1a5 + c.charCodeAt(0))) : "🏳️";
+const norm = (s) => String(s).normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+const singleColumn = () => window.matchMedia("(max-width: 1100px)").matches;
+const smoothScroll = reduceMotion ? "auto" : "smooth";
+function inView(el, fraction = 0.4) {
+  const r = el.getBoundingClientRect();
+  const visible = Math.min(r.bottom, innerHeight) - Math.max(r.top, 0);
+  return visible >= Math.min(r.height, innerHeight) * fraction;
+}
 
 async function getJSON(url, { timeout = 15000 } = {}) {
   const ctrl = new AbortController();
@@ -110,10 +184,26 @@ async function getJSON(url, { timeout = 15000 } = {}) {
     const res = await fetch(url, { signal: ctrl.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
+  } catch (err) {
+    if (err.name === "AbortError") throw new Error("timed out");
+    if (err instanceof TypeError) throw new Error(navigator.onLine === false ? "you're offline" : "network error");
+    throw err;
   } finally {
     clearTimeout(timer);
   }
 }
+
+function toast(msg, { tone = "ok", ms = 2800 } = {}) {
+  const el = document.createElement("div");
+  el.className = `toast ${tone}`;
+  el.innerHTML = `${icon(tone === "ok" ? "check" : "alert")}<span>${esc(msg)}</span>`;
+  $("#toasts").append(el);
+  setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 320); }, ms);
+}
+
+const errorBox = (msg, retry) =>
+  `<div class="error-box">${icon("alert")}<span>${esc(msg)}</span>` +
+  `<button type="button" class="btn sm" data-retry="${retry}">${icon("refresh")}Try again</button></div>`;
 
 // ---------------------------------------------------------------------------
 // Map
@@ -126,25 +216,31 @@ const bctx = base.getContext("2d");
 let W = 0, H = 0, DPR = 1, baseDirty = true;
 
 function resize() {
-  DPR = Math.min(window.devicePixelRatio || 1, 2);
-  W = wrap.clientWidth;
-  H = wrap.clientHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  // Assigning canvas.width clears it, so only do it when the size really changed,
+  // and repaint straight away instead of flashing an empty frame.
+  if (w === W && h === H && dpr === DPR) return;
+  DPR = dpr; W = w; H = h;
   for (const c of [canvas, base]) {
     c.width = Math.round(W * DPR);
     c.height = Math.round(H * DPR);
   }
   baseDirty = true;
+  if (W && H) render(performance.now());
 }
 
-function projection() {
+function makeProjection({ rotate, zoom, panY }) {
   if (state.proj === "globe") {
     const r = Math.min(W, H) / 2 - 18;
-    return d3.geoOrthographic().rotate(state.rotate).scale(r * state.zoom).translate([W / 2, H / 2]).clipAngle(90).precision(0.6);
+    return d3.geoOrthographic().rotate(rotate).scale(r * zoom).translate([W / 2, H / 2]).clipAngle(90).precision(0.6);
   }
-  const p = d3.geoNaturalEarth1().rotate([state.rotate[0], 0, 0]).fitExtent([[12, 12], [W - 12, H - 12]], { type: "Sphere" });
-  p.scale(p.scale() * state.zoom).translate([W / 2, H / 2 + state.panY]);
+  const p = d3.geoNaturalEarth1().rotate([rotate[0], 0, 0]).fitExtent([[12, 12], [W - 12, H - 12]], { type: "Sphere" });
+  p.scale(p.scale() * zoom).translate([W / 2, H / 2 + panY]);
   return p;
 }
+const projection = () => makeProjection(state);
+const clampPanY = (y, zoom = state.zoom) => Math.max(-H * zoom * 0.4, Math.min(H * zoom * 0.4, y));
 
 // Subsolar point (lon, lat) — accurate to well under a degree, plenty for a terminator.
 function subsolar(date = new Date()) {
@@ -174,40 +270,59 @@ function drawBase(proj) {
 
   if (globe) {
     // atmosphere glow
-    const glow = c.createRadialGradient(cx, cy, R * 0.95, cx, cy, R * 1.18);
-    glow.addColorStop(0, "rgba(90,162,255,0.35)");
-    glow.addColorStop(1, "rgba(90,162,255,0)");
+    const glow = c.createRadialGradient(cx, cy, R * 0.96, cx, cy, R * 1.2);
+    glow.addColorStop(0, "rgba(106,168,255,0.38)");
+    glow.addColorStop(0.4, "rgba(106,168,255,0.12)");
+    glow.addColorStop(1, "rgba(106,168,255,0)");
     c.fillStyle = glow;
-    c.beginPath(); c.arc(cx, cy, R * 1.18, 0, 2 * Math.PI); c.fill();
+    c.beginPath(); c.arc(cx, cy, R * 1.2, 0, 2 * Math.PI); c.fill();
   }
 
   // ocean
   c.beginPath(); path({ type: "Sphere" });
-  const ocean = globe
-    ? c.createRadialGradient(cx - R * 0.35, cy - R * 0.35, R * 0.1, cx, cy, R)
-    : c.createLinearGradient(0, 0, 0, H);
-  ocean.addColorStop(0, "#14284d");
-  ocean.addColorStop(1, "#070f22");
+  let ocean;
+  if (globe) {
+    ocean = c.createRadialGradient(cx - R * 0.3, cy - R * 0.35, R * 0.05, cx, cy, R * 1.02);
+    ocean.addColorStop(0, "#1b3a6e");
+    ocean.addColorStop(0.55, "#10244b");
+    ocean.addColorStop(1, "#071129");
+  } else {
+    ocean = c.createLinearGradient(0, 0, 0, H);
+    ocean.addColorStop(0, "#132a55");
+    ocean.addColorStop(0.5, "#0f2247");
+    ocean.addColorStop(1, "#0a1733");
+  }
   c.fillStyle = ocean; c.fill();
 
   // graticule
   c.beginPath(); path(d3.geoGraticule10());
-  c.strokeStyle = "rgba(140,170,230,0.09)"; c.lineWidth = 0.6; c.stroke();
+  c.strokeStyle = "rgba(150,180,240,0.08)"; c.lineWidth = 0.6; c.stroke();
 
   if (g) {
     const hi = !state.moving; // high-res when still
-    c.beginPath(); path(hi ? g.land50 : g.land110);
-    c.fillStyle = "#1f3256"; c.fill();
+    const land = hi ? g.land50 : g.land110;
+    c.beginPath(); path(land);
+    c.fillStyle = "#2b4c80"; c.fill();
+    c.strokeStyle = "rgba(150,195,255,0.45)"; c.lineWidth = 0.7; c.stroke();
 
     if (state.hovered && state.hovered !== state.selected) {
-      c.beginPath(); path(state.hovered); c.fillStyle = "#2a4677"; c.fill();
+      c.beginPath(); path(state.hovered); c.fillStyle = "#3a64a6"; c.fill();
     }
     if (state.selected) {
-      c.beginPath(); path(state.selected); c.fillStyle = "#3466b8"; c.fill();
-      c.strokeStyle = "#a8cbff"; c.lineWidth = 1.2; c.stroke();
+      c.beginPath(); path(state.selected); c.fillStyle = "#4f86e0"; c.fill();
     }
     c.beginPath(); path(hi ? g.borders50 : g.borders110);
-    c.strokeStyle = "rgba(170,200,255,0.28)"; c.lineWidth = 0.5; c.stroke();
+    c.strokeStyle = "rgba(200,220,255,0.30)"; c.lineWidth = 0.5; c.stroke();
+  }
+
+  if (globe) {
+    // spherical shading: soft highlight top-left, darker limb
+    const shade = c.createRadialGradient(cx - R * 0.4, cy - R * 0.45, 0, cx, cy, R);
+    shade.addColorStop(0, "rgba(255,255,255,0.09)");
+    shade.addColorStop(0.5, "rgba(255,255,255,0)");
+    shade.addColorStop(1, "rgba(2,6,20,0.38)");
+    c.beginPath(); path({ type: "Sphere" });
+    c.fillStyle = shade; c.fill();
   }
 
   if (state.layers.night) {
@@ -219,9 +334,16 @@ function drawBase(proj) {
     }
   }
 
+  if (g && state.selected) {
+    // drawn after the night shading so the selection stays visible on the dark side
+    c.beginPath(); path(state.selected);
+    c.fillStyle = "rgba(120,170,255,0.18)"; c.fill();
+    c.strokeStyle = "#dce9ff"; c.lineWidth = 1.5; c.stroke();
+  }
+
   // rim
   c.beginPath(); path({ type: "Sphere" });
-  c.strokeStyle = "rgba(168,203,255,0.35)"; c.lineWidth = 1; c.stroke();
+  c.strokeStyle = "rgba(168,203,255,0.38)"; c.lineWidth = 1; c.stroke();
   baseDirty = false;
 }
 
@@ -231,53 +353,70 @@ function visible(proj, lonlat) {
   return d3.geoDistance(lonlat, [-r[0], -r[1]]) < Math.PI / 2 - 0.02;
 }
 
+const isPinned = (kind, d) => state.pinned?.kind === kind && state.pinned.id === d.id;
+
 let markers = []; // screen-space hit list
 function drawMarkers(proj, t) {
   const c = ctx;
   markers = [];
-  const z = state.zoom;
+  const z = Math.min(state.zoom, 3);
+  let pinnedAt = null;
 
   if (state.layers.events) {
     for (const ev of state.events) {
       if (state.hiddenCats.has(ev.cat.key) || !visible(proj, ev.coord)) continue;
       const p = proj(ev.coord);
       if (!p) continue;
-      const size = 95 * Math.min(z, 3);
+      const size = 95 * z;
+      const hot = state.hoverMarker === ev || isPinned("event", ev);
       c.save();
       c.translate(p[0], p[1]);
       c.beginPath();
-      d3.symbol(ev.cat.symbol, size).context(c)();
+      d3.symbol(ev.cat.symbol, hot ? size * 1.35 : size).context(c)();
       c.fillStyle = ev.cat.color;
       c.strokeStyle = "#0b1222"; c.lineWidth = 2;
       c.stroke(); c.fill();
-      if (state.hoverMarker === ev) { c.strokeStyle = "#fff"; c.lineWidth = 1.5; c.stroke(); }
+      if (hot) { c.strokeStyle = "#fff"; c.lineWidth = 1.5; c.stroke(); }
       c.restore();
-      markers.push({ kind: "event", d: ev, x: p[0], y: p[1], r: Math.sqrt(size) / 1.4 + 4 });
+      const r = Math.sqrt(size) / 1.4 + 4;
+      if (isPinned("event", ev)) pinnedAt = { x: p[0], y: p[1], r };
+      markers.push({ kind: "event", d: ev, x: p[0], y: p[1], r });
     }
   }
 
   if (state.layers.quakes) {
-    // draw biggest first so small ones stay clickable on top
+    // drawn biggest first so small ones stay clickable on top
     for (const q of state.quakes) {
       if (!visible(proj, q.coord)) continue;
       const p = proj(q.coord);
       if (!p) continue;
-      const r = quakeRadius(q.mag, Math.min(z, 3));
+      const r = quakeRadius(q.mag, z);
       const col = quakeColor(q.mag);
       const age = Date.now() - q.time;
-      if (age < 3600e3) {
+      if (age < 3600e3 && !reduceMotion) {
         // pulse for quakes within the last hour
         const ph = ((t / 1600) + q.phase) % 1;
         c.beginPath(); c.arc(p[0], p[1], r + ph * 22, 0, 2 * Math.PI);
         c.strokeStyle = d3.color(col).copy({ opacity: 1 - ph }).toString(); c.lineWidth = 1.5; c.stroke();
       }
+      const hot = state.hoverMarker === q || isPinned("quake", q);
       c.beginPath(); c.arc(p[0], p[1], r, 0, 2 * Math.PI);
-      c.fillStyle = d3.color(col).copy({ opacity: 0.55 }).toString(); c.fill();
-      c.strokeStyle = state.hoverMarker === q ? "#fff" : col;
-      c.lineWidth = state.hoverMarker === q ? 2 : 1.2;
+      c.fillStyle = d3.color(col).copy({ opacity: hot ? 0.85 : 0.55 }).toString(); c.fill();
+      c.strokeStyle = hot ? "#fff" : col;
+      c.lineWidth = hot ? 2 : 1.2;
       c.stroke();
-      markers.push({ kind: "quake", d: q, x: p[0], y: p[1], r: r + 3 });
+      if (isPinned("quake", q)) pinnedAt = { x: p[0], y: p[1], r };
+      markers.push({ kind: "quake", d: q, x: p[0], y: p[1], r: Math.max(r + 3, 8) });
     }
+  }
+
+  if (pinnedAt) {
+    // selection ring with a gentle breathing pulse
+    const k = reduceMotion ? 0.5 : (Math.sin(t / 380) + 1) / 2;
+    c.beginPath(); c.arc(pinnedAt.x, pinnedAt.y, pinnedAt.r + 6 + k * 3, 0, 2 * Math.PI);
+    c.strokeStyle = "rgba(255,255,255,0.9)"; c.lineWidth = 2; c.stroke();
+    c.beginPath(); c.arc(pinnedAt.x, pinnedAt.y, pinnedAt.r + 11 + k * 5, 0, 2 * Math.PI);
+    c.strokeStyle = `rgba(255,255,255,${0.25 - k * 0.15})`; c.lineWidth = 1.5; c.stroke();
   }
 }
 
@@ -286,7 +425,10 @@ let lastDetailT = 0;
 function frame(t) {
   const dt = Math.min(64, t - (lastT || t));
   lastT = t;
-  if (state.autoRotate && !dragging && performance.now() - state.lastInteract > 9000 && !flying) {
+  const idle = performance.now() - state.lastInteract > IDLE_BEFORE_ROTATE_MS;
+  const shouldRotate = state.autoRotate && state.proj === "globe" && idle && !dragging && !flying &&
+    !state.pinned && !state.selected && !state.pointerInside && !document.hidden;
+  if (shouldRotate) {
     state.rotate[0] = (state.rotate[0] + dt * 0.0045) % 360;
     state.moving = true;
     baseDirty = true;
@@ -295,6 +437,11 @@ function frame(t) {
     state.moving = false; // settle → redraw in high resolution
     baseDirty = true;
   }
+  render(t);
+  requestAnimationFrame(frame);
+}
+
+function render(t) {
   const proj = projection();
   if (baseDirty) drawBase(proj);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -302,7 +449,6 @@ function frame(t) {
   ctx.drawImage(base, 0, 0);
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   drawMarkers(proj, t);
-  requestAnimationFrame(frame);
 }
 
 function markMoving() {
@@ -311,36 +457,89 @@ function markMoving() {
   lastDetailT = performance.now();
 }
 
+// --- animated camera ---------------------------------------------------------
+let flying = false, animToken = null;
+function animateView(target, ms = 1000) {
+  const from = { rotate: [...state.rotate], zoom: state.zoom, panY: state.panY };
+  const toRotate = [...(target.rotate ?? from.rotate)];
+  // take the short way round
+  toRotate[0] = from.rotate[0] + ((((toRotate[0] - from.rotate[0]) % 360) + 540) % 360) - 180;
+  const toZoom = target.zoom ?? from.zoom;
+  const toPan = target.panY ?? from.panY;
+  const ir = d3.interpolate(from.rotate, toRotate);
+  const dur = reduceMotion ? 1 : ms;
+  const t0 = performance.now();
+  const token = (animToken = {});
+  flying = true;
+  (function step(now) {
+    if (animToken !== token) return;
+    const k = d3.easeCubicInOut(Math.min(1, (now - t0) / dur));
+    state.rotate = ir(k);
+    state.zoom = from.zoom * Math.pow(toZoom / from.zoom, k); // geometric: feels uniform
+    state.panY = from.panY + (toPan - from.panY) * k;
+    state.lastInteract = performance.now();
+    markMoving();
+    if (k < 1) requestAnimationFrame(step);
+    else { flying = false; animToken = null; }
+  })(t0);
+}
+function stopAnim() { animToken = null; flying = false; }
+
+function flyTo(lonlat, zoom) {
+  const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom ?? Math.max(state.zoom, 1.6)));
+  if (state.proj === "globe") {
+    animateView({ rotate: [-lonlat[0], -lonlat[1], 0], zoom: z }, 1100);
+  } else {
+    // flat map: centre longitude by rotation, latitude by vertical pan
+    const rot = [-lonlat[0], 0, 0];
+    const p = makeProjection({ rotate: rot, zoom: z, panY: 0 })(lonlat);
+    animateView({ rotate: rot, zoom: z, panY: p ? clampPanY(H / 2 - p[1], z) : 0 }, 1100);
+  }
+}
+
+const zoomBy = (f) => animateView({ zoom: Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, state.zoom * f)) }, 280);
+function resetView() {
+  animateView({ rotate: defaultRotate(state.proj), zoom: 1, panY: 0 }, 900);
+}
+
 // --- interaction: drag / pinch / wheel / hover / click -----------------------
-let dragging = false, flying = false, downAt = null, moved = 0;
+let dragging = false, downAt = null, moved = 0;
 const pointers = new Map();
 let pinchStart = null;
+const onOverlay = (e) => e.target.closest?.(".map-controls, .map-info, .map-notice");
 
 wrap.addEventListener("pointerdown", (e) => {
+  if (onOverlay(e) || (e.pointerType === "mouse" && e.button !== 0)) return;
   wrap.setPointerCapture(e.pointerId);
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pointers.size === 2) {
     const [a, b] = [...pointers.values()];
     pinchStart = { dist: Math.hypot(a.x - b.x, a.y - b.y), zoom: state.zoom };
   }
-  dragging = true; moved = 0; flying = false;
+  stopAnim();
+  dragging = true; moved = 0;
   downAt = { x: e.clientX, y: e.clientY };
   state.lastInteract = performance.now();
   wrap.classList.add("dragging");
-  fadeHint();
 });
 
 wrap.addEventListener("pointermove", (e) => {
+  if (e.pointerType === "mouse") state.pointerInside = true;
   const prev = pointers.get(e.pointerId);
-  if (!prev) return hover(e);
+  if (!prev) {
+    if (onOverlay(e)) { hideTooltip(); return; }
+    return hover(e);
+  }
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pointers.size === 2 && pinchStart) {
     const [a, b] = [...pointers.values()];
     setZoom(pinchStart.zoom * (Math.hypot(a.x - b.x, a.y - b.y) / pinchStart.dist));
+    moved += 10;
     return;
   }
   const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
   moved += Math.abs(dx) + Math.abs(dy);
+  if (moved > 4) fadeHint();
   const proj = projection();
   if (state.proj === "globe") {
     const k = 57.3 / proj.scale();
@@ -348,7 +547,7 @@ wrap.addEventListener("pointermove", (e) => {
     state.rotate[1] = Math.max(-89, Math.min(89, state.rotate[1] - dy * k));
   } else {
     state.rotate[0] += dx * (360 / (proj.scale() * 2 * Math.PI));
-    state.panY = Math.max(-H * state.zoom * 0.4, Math.min(H * state.zoom * 0.4, state.panY + dy));
+    state.panY = clampPanY(state.panY + dy);
   }
   state.lastInteract = performance.now();
   hideTooltip();
@@ -356,29 +555,79 @@ wrap.addEventListener("pointermove", (e) => {
 });
 
 function endPointer(e) {
+  if (!pointers.has(e.pointerId)) return;
   pointers.delete(e.pointerId);
   if (pointers.size < 2) pinchStart = null;
   if (pointers.size === 0) {
     dragging = false;
     wrap.classList.remove("dragging");
-    if (moved < 6 && downAt) click(e);
+    if (moved < 6 && downAt && e.type === "pointerup") click(e);
   }
 }
 wrap.addEventListener("pointerup", endPointer);
 wrap.addEventListener("pointercancel", endPointer);
-wrap.addEventListener("pointerleave", () => { if (!dragging) { hideTooltip(); setHovered(null); } });
+wrap.addEventListener("pointerleave", () => {
+  state.pointerInside = false;
+  if (!dragging) { hideTooltip(); setHovered(null); state.hoverMarker = null; }
+});
 
+// Cooperative scrolling: a plain mouse wheel scrolls the page; Ctrl/⌘ + wheel (and trackpad
+// pinch, which browsers report as ctrl+wheel) zooms the map. In full screen the wheel always zooms.
+let noticeTimer;
 wrap.addEventListener("wheel", (e) => {
+  const zoomGesture = e.ctrlKey || e.metaKey || document.fullscreenElement === $("#map-card");
+  if (!zoomGesture) {
+    showNotice(`Hold ${isMac ? "⌘" : "Ctrl"} while scrolling to zoom, or use the + / − buttons`);
+    return;
+  }
   e.preventDefault();
-  setZoom(state.zoom * Math.exp(-e.deltaY * 0.0015));
+  stopAnim();
+  setZoom(state.zoom * Math.exp(-e.deltaY * (e.ctrlKey && !e.metaKey && Math.abs(e.deltaY) < 50 ? 0.01 : 0.0015)));
   state.lastInteract = performance.now();
   fadeHint();
 }, { passive: false });
 
+function showNotice(text) {
+  let n = $("#map-notice");
+  if (!n) {
+    n = document.createElement("div");
+    n.id = "map-notice";
+    n.className = "map-notice";
+    wrap.append(n);
+  }
+  n.textContent = text;
+  n.classList.add("show");
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => n.classList.remove("show"), 1400);
+}
+
 function setZoom(z) {
-  state.zoom = Math.max(0.7, Math.min(10, z));
+  state.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z));
   markMoving();
 }
+
+// keyboard control when the map has focus
+wrap.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const step = 12 / Math.sqrt(state.zoom);
+  const keys = {
+    ArrowLeft: () => (state.rotate[0] += step),
+    ArrowRight: () => (state.rotate[0] -= step),
+    ArrowUp: () => state.proj === "globe"
+      ? (state.rotate[1] = Math.max(-89, state.rotate[1] - step))
+      : (state.panY = clampPanY(state.panY + 40)),
+    ArrowDown: () => state.proj === "globe"
+      ? (state.rotate[1] = Math.min(89, state.rotate[1] + step))
+      : (state.panY = clampPanY(state.panY - 40)),
+  };
+  if (!keys[e.key]) return;
+  e.preventDefault();
+  stopAnim();
+  keys[e.key]();
+  state.lastInteract = performance.now();
+  fadeHint();
+  markMoving();
+});
 
 function localPoint(e) {
   const r = canvas.getBoundingClientRect();
@@ -394,6 +643,12 @@ function hitMarker(x, y) {
   return best;
 }
 
+function inCountry(f, ll) {
+  const [[x0, y0], [x1, y1]] = f.bbox;
+  const inBox = x0 <= x1 ? ll[0] >= x0 && ll[0] <= x1 : ll[0] >= x0 || ll[0] <= x1;
+  return inBox && ll[1] >= y0 && ll[1] <= y1 && d3.geoContains(f, ll);
+}
+
 function countryAt(x, y) {
   if (!state.geo) return null;
   const proj = projection();
@@ -403,12 +658,7 @@ function countryAt(x, y) {
   // also reject clicks outside the sphere on the flat map
   const back = proj(ll);
   if (!back || Math.hypot(back[0] - x, back[1] - y) > 1) return null;
-  for (const f of state.geo.countries) {
-    const [[x0, y0], [x1, y1]] = f.bbox;
-    const inBox = x0 <= x1 ? ll[0] >= x0 && ll[0] <= x1 : ll[0] >= x0 || ll[0] <= x1;
-    if (inBox && ll[1] >= y0 && ll[1] <= y1 && d3.geoContains(f, ll)) return f;
-  }
-  return null;
+  return state.geo.countries.find((f) => inCountry(f, ll)) ?? null;
 }
 
 let hoverRaf = 0;
@@ -427,7 +677,7 @@ function hover(e) {
     const c = countryAt(x, y);
     setHovered(c);
     wrap.style.cursor = c ? "pointer" : "";
-    if (c) showTooltip(x, y, `<strong>${flagEmoji(c.a2)} ${esc(c.name)}</strong><span class="muted">Click for indicators</span>`);
+    if (c) showTooltip(x, y, `<strong>${flagEmoji(c.a2)} ${esc(c.name)}</strong><span class="muted">${c === state.selected ? "Selected" : "Click for country details"}</span>`);
     else hideTooltip();
   });
 }
@@ -439,13 +689,16 @@ function setHovered(f) {
 function click(e) {
   const [x, y] = localPoint(e);
   const m = hitMarker(x, y);
-  if (m) {
-    if (m.kind === "quake") { switchTab("quakes"); focusListItem("quake", m.d.id); }
-    else { switchTab("events"); focusListItem("event", m.d.id); }
-    return;
-  }
+  hideTooltip();
+  if (m) { pin(m.kind, m.d); return; }
   const c = countryAt(x, y);
-  if (c) selectCountry(c);
+  if (c) {
+    state.pinned = null;
+    clearListSelection();
+    selectCountry(c);
+  } else if (state.pinned) {
+    unpin();
+  }
 }
 
 const tooltip = $("#tooltip");
@@ -463,7 +716,7 @@ function hideTooltip() { tooltip.hidden = true; }
 
 const quakeTip = (q) =>
   `<strong>M${q.mag.toFixed(1)} · ${esc(q.place)}</strong>` +
-  `<span class="muted">${ago(q.time)} · depth ${q.depth.toFixed(0)} km${q.tsunami ? " · tsunami flag" : ""}</span>`;
+  `<span class="muted">${quakeClass(q.mag)} · ${ago(q.time)} · ${q.depth.toFixed(0)} km deep${q.tsunami ? " · tsunami flag" : ""}</span>`;
 const eventTip = (ev) =>
   `<strong>${esc(ev.title)}</strong><span class="muted">${esc(ev.catTitle)} · updated ${ago(ev.date)}</span>`;
 
@@ -474,58 +727,184 @@ function fadeHint() {
   $("#map-hint").style.opacity = "0";
 }
 
-function flyTo(lonlat, zoom) {
-  const from = [...state.rotate];
-  const to = [-lonlat[0], state.proj === "globe" ? -lonlat[1] : from[1], 0];
-  // take the short way round
-  to[0] = from[0] + ((((to[0] - from[0]) % 360) + 540) % 360) - 180;
-  const z0 = state.zoom, z1 = zoom ?? Math.max(state.zoom, 1.6);
-  const interp = d3.interpolate(from, to);
-  const t0 = performance.now();
-  flying = true;
-  state.lastInteract = t0;
-  if (state.proj !== "globe") state.panY = 0;
-  (function step(now) {
-    const k = d3.easeCubicInOut(Math.min(1, (now - t0) / 1100));
-    state.rotate = interp(k);
-    state.zoom = z0 + (z1 - z0) * k;
-    markMoving();
-    state.lastInteract = performance.now();
-    if (k < 1 && flying) requestAnimationFrame(step);
-    else flying = false;
-  })(t0);
+// --- map control buttons -----------------------------------------------------
+$("#zoom-in").addEventListener("click", () => zoomBy(1.5));
+$("#zoom-out").addEventListener("click", () => zoomBy(1 / 1.5));
+$("#reset-view").addEventListener("click", resetView);
+$("#rotate-btn").addEventListener("click", () => toggleRotate());
+
+function toggleRotate(on = !state.autoRotate) {
+  state.autoRotate = on;
+  if (on) state.lastInteract = 0; // start straight away
+  renderRotateBtn();
+  savePrefs();
+  if (on && (state.pinned || state.selected)) toast("Rotation resumes when nothing is selected", { tone: "ok" });
+}
+function renderRotateBtn() {
+  const b = $("#rotate-btn");
+  b.setAttribute("aria-pressed", String(state.autoRotate));
+  b.title = state.autoRotate ? "Pause rotation (P)" : "Resume rotation (P)";
+  b.innerHTML = icon(state.autoRotate ? "pause" : "play");
+  b.hidden = state.proj !== "globe";
+}
+
+const mapCard = $("#map-card");
+const fsBtn = $("#fullscreen-btn");
+if (document.fullscreenEnabled) fsBtn.hidden = false;
+fsBtn.addEventListener("click", toggleFullscreen);
+function toggleFullscreen() {
+  if (!document.fullscreenEnabled) return;
+  if (document.fullscreenElement) document.exitFullscreen();
+  else mapCard.requestFullscreen().catch(() => toast("Full screen isn't available here", { tone: "warn" }));
+}
+document.addEventListener("fullscreenchange", () => {
+  const on = document.fullscreenElement === mapCard;
+  fsBtn.title = on ? "Exit full screen (F)" : "Full screen (F)";
+  fsBtn.setAttribute("aria-label", on ? "Exit full screen" : "Full screen map");
+  requestAnimationFrame(resize);
+});
+
+// ---------------------------------------------------------------------------
+// Pinned markers + on-map detail card
+// ---------------------------------------------------------------------------
+const findItem = (kind, id) => (kind === "quake" ? state.quakes : state.events).find((d) => d.id === id);
+
+function pin(kind, item, { fly = false } = {}) {
+  state.pinned = { kind, id: item.id };
+  state.hoverMarker = null;
+  switchTab(kind === "quake" ? "quakes" : "events");
+  selectInList(kind, item.id);
+  if (fly) flyTo(item.coord, Math.max(state.zoom, 2.2));
+  renderMapInfo();
+  fadeHint();
+}
+
+function unpin() {
+  state.pinned = null;
+  clearListSelection();
+  renderMapInfo();
+}
+
+function clearListSelection() {
+  $$(".feed-item.selected").forEach((n) => n.classList.remove("selected"));
+}
+
+function selectInList(kind, id) {
+  clearListSelection();
+  const li = document.querySelector(`.feed-item[data-kind="${kind}"][data-id="${CSS.escape(id)}"]`);
+  if (!li) return;
+  li.classList.add("selected");
+  // scroll inside the panel only, never the page
+  const box = li.closest(".tab-panel");
+  if (box && !box.hidden) {
+    const top = li.offsetTop - box.clientHeight / 2 + li.offsetHeight / 2;
+    box.scrollTo({ top: Math.max(0, top), behavior: smoothScroll });
+  }
+}
+
+function renderMapInfo() {
+  const box = $("#map-info");
+  const p = state.pinned;
+  const item = p && findItem(p.kind, p.id);
+  let html = "", kind = "";
+  if (item && p.kind === "quake") {
+    kind = "quake";
+    const q = item;
+    html = `<span class="mag" style="--c:${quakeColor(q.mag)}">${q.mag.toFixed(1)}</span>
+      <div><h3>${esc(q.place)}</h3>
+        <div class="info-meta"><span>${quakeClass(q.mag)} quake</span>${timeTag(q.time)}<span>${q.depth.toFixed(0)} km deep</span>${quakeBadges(q)}</div>
+        <div class="info-actions"><a class="btn sm" href="${esc(q.url)}" target="_blank" rel="noopener">Details on USGS ${icon("external")}</a></div>
+      </div>
+      <button type="button" class="btn icon ghost close" data-action="unpin" aria-label="Close details" title="Close (Esc)">${icon("x")}</button>`;
+  } else if (item && p.kind === "event") {
+    kind = "event";
+    const ev = item;
+    html = `<span class="ev-icon">${symbolSVG(ev.cat.symbol, ev.cat.color, 120, 20)}</span>
+      <div><h3>${esc(ev.title)}</h3>
+        <div class="info-meta"><span>${esc(ev.catTitle)}</span><span>updated ${timeTag(ev.date)}</span>${ev.magnitude ? `<span>${esc(ev.magnitude)}</span>` : ""}</div>
+        ${ev.link ? `<div class="info-actions"><a class="btn sm" href="${esc(ev.link)}" target="_blank" rel="noopener">Source ${icon("external")}</a></div>` : ""}
+      </div>
+      <button type="button" class="btn icon ghost close" data-action="unpin" aria-label="Close details" title="Close (Esc)">${icon("x")}</button>`;
+  } else if (state.selected) {
+    // Only visible on narrow layouts, where the country panel is below the map.
+    kind = "country";
+    const f = state.selected;
+    html = `<span class="flag">${flagEmoji(f.a2)}</span>
+      <div><h3>${esc(f.name)}</h3>
+        <div class="info-meta"><span>${esc(f.a3 ?? "")}</span>${f.currency ? `<span>${esc(f.currency)}</span>` : ""}</div>
+        <div class="info-actions"><button type="button" class="btn sm primary" data-action="country-details">See country details ${icon("down")}</button></div>
+      </div>
+      <button type="button" class="btn icon ghost close" data-action="clear-country" aria-label="Clear selection" title="Clear (Esc)">${icon("x")}</button>`;
+  }
+  box.hidden = !html;
+  box.dataset.kind = kind;
+  box.innerHTML = html;
 }
 
 // ---------------------------------------------------------------------------
-// Legend
+// Legend + event filters
 // ---------------------------------------------------------------------------
-function symbolSVG(symbol, color, size = 70) {
+function symbolSVG(symbol, color, size = 70, px = 14) {
   const d = d3.symbol(symbol, size)();
-  return `<svg width="14" height="14" viewBox="-7 -7 14 14" aria-hidden="true"><path d="${d}" fill="${color}" stroke="#0b1222" stroke-width="1"/></svg>`;
+  return `<svg width="${px}" height="${px}" viewBox="-7 -7 14 14" aria-hidden="true" style="overflow:visible"><path d="${d}" fill="${color}" stroke="#0b1222" stroke-width="1"/></svg>`;
 }
 function renderLegend() {
   const qs = [3, 5, 7].map((m) => {
     const r = Math.min(quakeRadius(m, 1), 11);
-    return `<span class="legend-item" style="cursor:default"><svg width="${2 * r + 4}" height="${2 * r + 4}" aria-hidden="true"><circle cx="${r + 2}" cy="${r + 2}" r="${r}" fill="${quakeColor(m)}" fill-opacity=".55" stroke="${quakeColor(m)}"/></svg>M${m}</span>`;
+    return `<span class="legend-item"><svg width="${2 * r + 4}" height="${2 * r + 4}" aria-hidden="true"><circle cx="${r + 2}" cy="${r + 2}" r="${r}" fill="${quakeColor(m)}" fill-opacity=".55" stroke="${quakeColor(m)}"/></svg>M${m}</span>`;
   });
+  qs.push(`<span class="legend-item" title="Earthquakes in the last hour pulse on the map"><svg width="18" height="18" aria-hidden="true"><circle cx="9" cy="9" r="3.5" fill="#e0302a" fill-opacity=".7"/><circle cx="9" cy="9" r="7.5" fill="none" stroke="#e0302a" stroke-opacity=".6" stroke-dasharray="2 2"/></svg>Last hour</span>`);
   const evs = EVENT_CATS.map(
-    (c) => `<button type="button" class="legend-item" data-cat="${c.key}" aria-pressed="${!state.hiddenCats.has(c.key)}" title="Toggle ${c.label}">${symbolSVG(c.symbol, c.color)}${c.label} <span class="muted" data-count="${c.key}"></span></button>`,
+    (c) => `<button type="button" class="legend-item" data-cat="${c.key}" aria-pressed="${!state.hiddenCats.has(c.key)}" title="Show or hide ${c.label.toLowerCase()}">${symbolSVG(c.symbol, c.color)}${c.label} <span class="count" data-count="${c.key}"></span></button>`,
   );
   $("#legend").innerHTML =
-    `<span class="muted">Earthquakes</span>${qs.join("")}<span class="legend-sep"></span><span class="muted">Natural events</span>${evs.join("")}`;
-  $("#legend").querySelectorAll("[data-cat]").forEach((b) =>
-    b.addEventListener("click", () => {
-      const k = b.dataset.cat;
-      state.hiddenCats.has(k) ? state.hiddenCats.delete(k) : state.hiddenCats.add(k);
-      b.setAttribute("aria-pressed", String(!state.hiddenCats.has(k)));
-      renderEventList();
-    }),
-  );
+    `<span class="legend-group"><span class="legend-title">Quakes</span>${qs.join("")}</span><span class="legend-sep" aria-hidden="true"></span>` +
+    `<span class="legend-group"><span class="legend-title">Events</span>${evs.join("")}</span>`;
 }
+
+function renderEventFilters() {
+  $("#event-filters").innerHTML = EVENT_CATS.map(
+    (c) => `<button type="button" class="filter-chip" data-cat="${c.key}" aria-pressed="${!state.hiddenCats.has(c.key)}">${symbolSVG(c.symbol, c.color, 60, 12)}${c.label} <span class="count" data-count="${c.key}"></span></button>`,
+  ).join("");
+}
+
+function toggleCat(k) {
+  state.hiddenCats.has(k) ? state.hiddenCats.delete(k) : state.hiddenCats.add(k);
+  $$(`[data-cat="${k}"]`).forEach((b) => b.setAttribute("aria-pressed", String(!state.hiddenCats.has(k))));
+  renderEventList();
+  savePrefs();
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-cat]");
+  if (b) toggleCat(b.dataset.cat);
+});
 
 // ---------------------------------------------------------------------------
 // Data: geography
 // ---------------------------------------------------------------------------
+function mainPolygon(f) {
+  // the largest polygon of a country (e.g. mainland France, not French Guiana)
+  if (f.geometry.type !== "MultiPolygon") return f;
+  let best = null, bestA = -1;
+  for (const coords of f.geometry.coordinates) {
+    const poly = { type: "Polygon", coordinates: coords };
+    const a = d3.geoArea(poly);
+    if (a > bestA) { bestA = a; best = poly; }
+  }
+  return best;
+}
+
+function countryFocus(f) {
+  if (f.focus) return f.focus;
+  const poly = mainPolygon(f);
+  const center = d3.geoCentroid(poly);
+  const [[x0, y0], [x1, y1]] = d3.geoBounds(poly);
+  const lonSpan = ((x1 - x0) + 360) % 360 || 360;
+  const extent = Math.max(lonSpan * Math.cos((center[1] * Math.PI) / 180), y1 - y0, 0.5);
+  f.focus = { center, zoom: Math.max(1.3, Math.min(7, 46 / extent)) };
+  return f.focus;
+}
+
 async function loadGeo() {
   const [t50, t110, codes] = await Promise.all([
     getJSON("data/countries-50m.json"),
@@ -537,6 +916,7 @@ async function loadGeo() {
     const c = codes[f.id] ?? {};
     f.a2 = c.a2; f.a3 = c.a3; f.currency = c.currency;
     f.name = (c.a2 && regionNames?.of(c.a2)) || f.properties.name;
+    f.search = norm(f.name);
     f.bbox = d3.geoBounds(f);
     return f;
   });
@@ -549,6 +929,101 @@ async function loadGeo() {
   };
   baseDirty = true;
 }
+
+const countryByA3 = (a3) => state.geo?.countries.find((c) => c.a3 === a3);
+
+// ---------------------------------------------------------------------------
+// Country search
+// ---------------------------------------------------------------------------
+const searchInput = $("#search-input");
+const searchList = $("#search-results");
+let searchHits = [], searchActive = 0;
+
+function searchCountries(q) {
+  const n = norm(q.trim());
+  if (!n || !state.geo) return [];
+  const seen = new Set();
+  const scored = [];
+  const alias = ALIASES[n] && countryByA3(ALIASES[n]);
+  if (alias) { scored.push({ f: alias, s: -1 }); seen.add(alias.name); }
+  for (const f of state.geo.countries) {
+    if (seen.has(f.name)) continue;
+    const name = f.search;
+    let s = -1;
+    if (name.startsWith(n)) s = 0;
+    else if (f.a3?.toLowerCase() === n || f.a2?.toLowerCase() === n) s = 0.5;
+    else if (name.split(/[\s\-’'(]+/).some((w) => w.startsWith(n))) s = 1;
+    else if (name.includes(n)) s = 2;
+    if (s >= 0) { scored.push({ f, s }); seen.add(f.name); }
+  }
+  return scored.sort((a, b) => a.s - b.s || a.f.name.localeCompare(b.f.name)).slice(0, 8).map((x) => x.f);
+}
+
+function highlight(name, q) {
+  const n = norm(q.trim());
+  const i = norm(name).indexOf(n);
+  if (i < 0 || !n || norm(name.slice(i, i + n.length)) !== n) return esc(name);
+  return esc(name.slice(0, i)) + "<mark>" + esc(name.slice(i, i + n.length)) + "</mark>" + esc(name.slice(i + n.length));
+}
+
+function renderSearch() {
+  const q = searchInput.value;
+  if (!q.trim()) return closeSearch();
+  searchHits = searchCountries(q);
+  searchActive = Math.min(searchActive, Math.max(0, searchHits.length - 1));
+  searchList.innerHTML = !state.geo
+    ? `<li class="empty">Map data is still loading…</li>`
+    : searchHits.length
+      ? searchHits.map((f, i) =>
+        `<li role="option" id="sr-${i}" data-i="${i}" aria-selected="${i === searchActive}"><span class="flag-sm">${flagEmoji(f.a2)}</span><span>${highlight(f.name, q)}</span><span class="code">${esc(f.a3 ?? "")}</span></li>`).join("")
+      : `<li class="empty">No country matches “${esc(q.trim())}”</li>`;
+  searchList.hidden = false;
+  searchInput.setAttribute("aria-expanded", "true");
+  if (searchHits.length) searchInput.setAttribute("aria-activedescendant", `sr-${searchActive}`);
+  else searchInput.removeAttribute("aria-activedescendant");
+}
+
+function closeSearch() {
+  searchList.hidden = true;
+  searchInput.setAttribute("aria-expanded", "false");
+  searchInput.removeAttribute("aria-activedescendant");
+}
+
+function chooseSearch(i) {
+  const f = searchHits[i];
+  if (!f) return;
+  searchInput.value = "";
+  closeSearch();
+  searchInput.blur();
+  state.pinned = null;
+  clearListSelection();
+  selectCountry(f);
+  if (!inView(wrap, 0.5)) wrap.scrollIntoView({ behavior: smoothScroll, block: "center" });
+}
+
+searchInput.addEventListener("input", () => { searchActive = 0; renderSearch(); });
+searchInput.addEventListener("focus", () => { if (searchInput.value.trim()) renderSearch(); });
+searchInput.addEventListener("blur", () => setTimeout(closeSearch, 120));
+searchInput.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    if (!searchHits.length) return;
+    searchActive = (searchActive + (e.key === "ArrowDown" ? 1 : -1) + searchHits.length) % searchHits.length;
+    renderSearch();
+    $(`#sr-${searchActive}`)?.scrollIntoView({ block: "nearest" });
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    chooseSearch(searchActive);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    if (searchInput.value) { searchInput.value = ""; closeSearch(); } else searchInput.blur();
+  }
+});
+searchList.addEventListener("mousedown", (e) => e.preventDefault()); // keep focus in the input
+searchList.addEventListener("click", (e) => {
+  const li = e.target.closest("[data-i]");
+  if (li) chooseSearch(+li.dataset.i);
+});
 
 // ---------------------------------------------------------------------------
 // Data: earthquakes (USGS — public domain)
@@ -572,45 +1047,69 @@ async function loadQuakes() {
         phase: Math.random(),
       }))
       .sort((a, b) => b.mag - a.mag); // big first → small drawn on top
-    renderQuakeKPIs(data.metadata?.title);
+    state.quakesLoaded = true;
+    state.failed.delete("quakes");
+    renderQuakeKPIs();
     renderQuakeList();
+    if (state.pinned?.kind === "quake") renderMapInfo();
     if (state.selected) renderCountryLocalStats(state.selected);
   } catch (err) {
+    state.failed.add("quakes");
+    $("#kpi-quakes").textContent = state.quakesLoaded ? $("#kpi-quakes").textContent : "—";
     $("#kpi-quakes-sub").innerHTML = `<span class="error-note">USGS feed unavailable (${esc(err.message)})</span>`;
-    $("#quake-list").innerHTML = `<li class="empty">Couldn't reach the USGS feed. Retrying on next refresh.</li>`;
+    if (!state.quakesLoaded) {
+      $("#quake-list").innerHTML = `<li class="empty">${errorBox("We couldn't reach the USGS earthquake feed.", "quakes")}</li>`;
+      $("#kpi-strongest").textContent = "—";
+    }
   }
 }
 
-function renderQuakeKPIs(title) {
+function renderQuakeKPIs() {
   const q = state.quakes;
   $("#kpi-quakes").textContent = nf.format(q.length);
   $("#kpi-quakes-sub").textContent = $("#quake-feed").selectedOptions[0].textContent;
+  $("#count-quakes").textContent = q.length ? nf.format(q.length) : "";
   const top = q[0];
   if (top) {
     $("#kpi-strongest").textContent = "M" + top.mag.toFixed(1);
-    $("#kpi-strongest-sub").textContent = `${top.place} · ${ago(top.time)}`;
+    $("#kpi-strongest-sub").textContent = `${quakeClass(top.mag)} · ${top.place} · ${ago(top.time)}`;
     $("#kpi-strongest-sub").title = top.place;
   } else {
     $("#kpi-strongest").textContent = "—";
-    $("#kpi-strongest-sub").textContent = title ? "None in this feed" : "";
+    $("#kpi-strongest-sub").textContent = "None in this feed";
   }
 }
 
+const quakeBadges = (q) =>
+  (Date.now() - q.time < 3600e3 ? '<span class="badge new">New</span>' : "") +
+  (q.tsunami ? '<span class="badge tsunami" title="USGS flags this event for possible tsunami evaluation. Check official warnings.">Tsunami flag</span>' : "") +
+  (q.alert ? `<span class="badge alert-${esc(q.alert)}" title="USGS PAGER alert: estimated impact level">PAGER ${esc(q.alert)}</span>` : "");
+
+const LIST_LIMIT = 150;
 function renderQuakeList() {
-  const list = [...state.quakes].sort((a, b) => b.time - a.time).slice(0, 150);
+  const sorted = [...state.quakes].sort(state.quakeSort === "mag" ? (a, b) => b.mag - a.mag || b.time - a.time : (a, b) => b.time - a.time);
+  const list = sorted.slice(0, LIST_LIMIT);
+  $("#quake-list-note").textContent = state.quakes.length > LIST_LIMIT
+    ? `Top ${LIST_LIMIT} of ${nf.format(state.quakes.length)}`
+    : `${nf.format(state.quakes.length)} in feed`;
   $("#quake-list").innerHTML = list.length
-    ? list
-        .map(
-          (q) => `<li class="feed-item" tabindex="0" data-kind="quake" data-id="${esc(q.id)}">
-      <span class="mag" style="background:${d3.color(quakeColor(q.mag)).copy({ opacity: 0.35 })};border-color:${quakeColor(q.mag)}">${q.mag.toFixed(1)}</span>
-      <span style="min-width:0">
-        <div class="feed-title" title="${esc(q.place)}">${esc(q.place)}</div>
-        <div class="feed-meta"><span>${ago(q.time)}</span><span>${q.depth.toFixed(0)} km deep</span>${q.tsunami ? '<span class="badge tsunami">tsunami flag</span>' : ""}${q.alert ? `<span class="badge">PAGER ${esc(q.alert)}</span>` : ""}<a href="${esc(q.url)}" target="_blank" rel="noopener">USGS ↗</a></div>
-      </span></li>`,
-        )
-        .join("")
-    : `<li class="empty">No earthquakes in this feed right now.</li>`;
+    ? list.map((q) => `<li class="feed-item${isPinned("quake", q) ? " selected" : ""}" tabindex="0" data-kind="quake" data-id="${esc(q.id)}" aria-label="Magnitude ${q.mag.toFixed(1)}, ${esc(q.place)}, ${ago(q.time)}">
+      <span class="mag" style="--c:${quakeColor(q.mag)}">${q.mag.toFixed(1)}</span>
+      <span class="feed-body">
+        <span class="feed-title" title="${esc(q.place)}">${esc(q.place)}</span>
+        <span class="feed-meta">${timeTag(q.time)}<span>${q.depth.toFixed(0)} km deep</span>${quakeBadges(q)}</span>
+      </span>
+      <a class="feed-link" href="${esc(q.url)}" target="_blank" rel="noopener" title="Open on USGS" aria-label="Open on USGS">${icon("external")}</a></li>`).join("")
+    : `<li class="empty">No earthquakes in this feed right now. Try a longer time range.</li>`;
 }
+
+$$("[data-sort]").forEach((b) => b.addEventListener("click", () => {
+  state.quakeSort = b.dataset.sort;
+  $$("[data-sort]").forEach((x) => { x.classList.toggle("active", x === b); x.setAttribute("aria-pressed", String(x === b)); });
+  renderQuakeList();
+  $("#panel-quakes").scrollTop = 0;
+  savePrefs();
+}));
 
 // ---------------------------------------------------------------------------
 // Data: natural events (NASA EONET — public domain)
@@ -644,64 +1143,74 @@ async function loadEvents() {
       })
       .filter(Boolean)
       .sort((a, b) => b.date - a.date);
+    state.failed.delete("events");
 
     const counts = d3.rollup(state.events, (v) => v.length, (d) => d.cat.key);
     $("#kpi-events").textContent = nf.format(state.events.length);
+    $("#count-events").textContent = state.events.length ? nf.format(state.events.length) : "";
     const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 2).map(([k, n]) => `${n} ${catFor(k).label.toLowerCase()}`);
-    $("#kpi-events-sub").textContent = top.length ? top.join(" · ") : "None open";
+    $("#kpi-events-sub").textContent = top.length ? top.join(" · ") : "None open right now";
     for (const c of EVENT_CATS) {
-      const el = document.querySelector(`[data-count="${c.key}"]`);
-      if (el) el.textContent = counts.get(c.key) ?? 0;
+      $$(`[data-count="${c.key}"]`).forEach((el) => (el.textContent = counts.get(c.key) ?? 0));
     }
     renderEventList();
+    if (state.pinned?.kind === "event") renderMapInfo();
     if (state.selected) renderCountryLocalStats(state.selected);
   } catch (err) {
-    $("#kpi-events-sub").innerHTML = `<span class="error-note">EONET unavailable (${esc(err.message)})</span>`;
-    $("#event-list").innerHTML = `<li class="empty">Couldn't reach NASA EONET. Retrying on next refresh.</li>`;
+    state.failed.add("events");
+    $("#kpi-events-sub").innerHTML = `<span class="error-note">NASA EONET unavailable (${esc(err.message)})</span>`;
+    if (!state.events.length) {
+      $("#kpi-events").textContent = "—";
+      $("#event-list").innerHTML = `<li class="empty">${errorBox("We couldn't reach NASA's natural-event tracker.", "events")}</li>`;
+    }
   }
 }
 
 function renderEventList() {
+  if (!state.events.length && state.failed.has("events")) return;
   const list = state.events.filter((e) => !state.hiddenCats.has(e.cat.key)).slice(0, 200);
   $("#event-list").innerHTML = list.length
-    ? list
-        .map(
-          (ev) => `<li class="feed-item" tabindex="0" data-kind="event" data-id="${esc(ev.id)}">
-      <span class="ev-icon">${symbolSVG(ev.cat.symbol, ev.cat.color, 120).replace('width="14" height="14"', 'width="20" height="20"')}</span>
-      <span style="min-width:0">
-        <div class="feed-title" title="${esc(ev.title)}">${esc(ev.title)}</div>
-        <div class="feed-meta"><span>${esc(ev.catTitle)}</span><span>${ago(ev.date)}</span>${ev.magnitude ? `<span>${esc(ev.magnitude)}</span>` : ""}${ev.link ? `<a href="${esc(ev.link)}" target="_blank" rel="noopener">Source ↗</a>` : ""}</div>
-      </span></li>`,
-        )
-        .join("")
-    : `<li class="empty">No open events for the selected categories.</li>`;
+    ? list.map((ev) => `<li class="feed-item${isPinned("event", ev) ? " selected" : ""}" tabindex="0" data-kind="event" data-id="${esc(ev.id)}">
+      <span class="ev-icon">${symbolSVG(ev.cat.symbol, ev.cat.color, 120, 20)}</span>
+      <span class="feed-body">
+        <span class="feed-title" title="${esc(ev.title)}">${esc(ev.title)}</span>
+        <span class="feed-meta"><span>${esc(ev.catTitle)}</span>${timeTag(ev.date)}${ev.magnitude ? `<span>${esc(ev.magnitude)}</span>` : ""}</span>
+      </span>
+      ${ev.link ? `<a class="feed-link" href="${esc(ev.link)}" target="_blank" rel="noopener" title="Open source" aria-label="Open source">${icon("external")}</a>` : "<span></span>"}</li>`).join("")
+    : state.events.length
+      ? `<li class="empty">All event types are hidden. Use the filters above to show them again.</li>`
+      : `<li class="empty">No open natural events right now.</li>`;
 }
 
 // list → map
 for (const sel of ["#quake-list", "#event-list"]) {
   const el = $(sel);
   const go = (e) => {
-    if (e.target.closest("a")) return;
+    if (e.target.closest("a, button")) return;
     const li = e.target.closest(".feed-item");
     if (!li) return;
-    const item = li.dataset.kind === "quake"
-      ? state.quakes.find((q) => q.id === li.dataset.id)
-      : state.events.find((v) => v.id === li.dataset.id);
+    const kind = li.dataset.kind;
+    const item = findItem(kind, li.dataset.id);
     if (!item) return;
-    state.hoverMarker = item;
-    flyTo(item.coord, Math.max(state.zoom, 2.2));
-    el.querySelectorAll(".feed-item").forEach((n) => n.style.background = "");
-    li.style.background = "rgba(90,162,255,0.12)";
+    if (isPinned(kind, item) && e.type === "click") { unpin(); return; }
+    pin(kind, item, { fly: true });
+    if (singleColumn() && !inView(wrap, 0.6)) wrap.scrollIntoView({ behavior: smoothScroll, block: "center" });
   };
   el.addEventListener("click", go);
-  el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(e); } });
-}
-
-function focusListItem(kind, id) {
-  const li = document.querySelector(`.feed-item[data-kind="${kind}"][data-id="${CSS.escape(id)}"]`);
-  if (!li) return;
-  li.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  li.click();
+  el.addEventListener("keydown", (e) => {
+    if (e.target.closest("a")) return;
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(e); }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const li = e.target.closest(".feed-item");
+      const next = e.key === "ArrowDown" ? li?.nextElementSibling : li?.previousElementSibling;
+      if (next?.classList.contains("feed-item")) { e.preventDefault(); next.focus(); }
+    }
+  });
+  el.addEventListener("mouseover", (e) => {
+    const li = e.target.closest(".feed-item");
+    state.hoverMarker = li ? findItem(li.dataset.kind, li.dataset.id) ?? null : null;
+  });
+  el.addEventListener("mouseleave", () => (state.hoverMarker = null));
 }
 
 // ---------------------------------------------------------------------------
@@ -730,16 +1239,22 @@ function parseKp(raw) {
 async function loadKp() {
   try {
     state.kp = parseKp(await getJSON(API.kp)).slice(-24);
+    state.kpLoaded = true;
+    state.failed.delete("kp");
     const last = state.kp[state.kp.length - 1];
     if (last) {
       const lvl = kpLevel(last.kp);
-      $("#kpi-kp").innerHTML = `${last.kp.toFixed(2)}<span class="status-pill" style="background:${lvl.color}">${lvl.label}</span>`;
-      $("#kpi-kp-sub").textContent = `${last.kp >= 5 ? "Aurora likely at mid-latitudes" : last.kp >= 4 ? "Aurora possible at high latitudes" : "Calm magnetosphere"} · ${ago(last.time)}`;
+      $("#kpi-kp").innerHTML = `${last.kp.toFixed(1)}<span class="status-pill" style="background:${lvl.color}">${lvl.label}</span>`;
+      $("#kpi-kp-sub").textContent = `${kpOutlook(last.kp)} · ${ago(last.time)}`;
     }
     renderKpChart();
   } catch (err) {
-    $("#kpi-kp-sub").innerHTML = `<span class="error-note">SWPC unavailable (${esc(err.message)})</span>`;
-    $("#kp-chart").innerHTML = `<p class="muted small" style="padding:16px">Couldn't reach NOAA SWPC. Retrying on next refresh.</p>`;
+    state.failed.add("kp");
+    $("#kpi-kp-sub").innerHTML = `<span class="error-note">NOAA SWPC unavailable (${esc(err.message)})</span>`;
+    if (!state.kp.length) {
+      $("#kpi-kp").textContent = "—";
+      $("#kp-chart").innerHTML = errorBox("We couldn't reach NOAA's Space Weather Prediction Center.", "kp");
+    }
   }
 }
 
@@ -748,13 +1263,18 @@ function renderKpChart() {
   const data = state.kp;
   $("#kp-legend").innerHTML = KP_LEVELS.map((l) => `<span><i style="background:${l.color}"></i>${l.label}${l.min ? ` (Kp ≥ ${l.min})` : ""}</span>`).join("") +
     `<span><svg width="18" height="10" aria-hidden="true"><line x1="0" x2="18" y1="5" y2="5" stroke="#ec835a" stroke-dasharray="4 3"/></svg>Storm threshold</span>`;
+  if (!state.kpLoaded) {
+    if (!state.failed.has("kp")) el.innerHTML = `<div class="error-box"><span class="spinner"></span><span class="muted">Loading space weather…</span></div>`;
+    return;
+  }
   $("#kp-table tbody").innerHTML = [...data].reverse().map((d) =>
     `<tr><td>${d3.utcFormat("%a %d %b %H:%M")(d.time)}</td><td>${d.kp.toFixed(2)}</td><td>${kpLevel(d.kp).label}</td></tr>`).join("");
-  if (!data.length) { el.innerHTML = `<p class="muted small" style="padding:16px">No Kp data.</p>`; return; }
+  if (!data.length) { el.innerHTML = `<p class="muted small" style="padding:16px">No Kp data published right now.</p>`; return; }
 
-  const w = el.clientWidth - 24, h = el.clientHeight - 8;
+  const w = el.clientWidth - 24, h = el.clientHeight - 10;
+  if (w <= 0 || h <= 0) return;
   const m = { t: 10, r: 8, b: 26, l: 26 };
-  const x = d3.scaleBand().domain(data.map((d) => +d.time)).range([m.l, w - m.r]).paddingInner(0.12);
+  const x = d3.scaleBand().domain(data.map((d) => +d.time)).range([m.l, w - m.r]).paddingInner(0.14);
   const y = d3.scaleLinear().domain([0, 9]).range([h - m.b, m.t]);
   const bw = x.bandwidth();
   const rr = Math.min(4, bw / 2);
@@ -763,13 +1283,15 @@ function renderKpChart() {
     return `M${x0},${yb}V${y0 + rr}Q${x0},${y0} ${x0 + rr},${y0}H${x0 + bw - rr}Q${x0 + bw},${y0} ${x0 + bw},${y0 + rr}V${yb}Z`;
   };
   const dayTicks = data.filter((d) => d.time.getUTCHours() === 0).map((d) => +d.time);
+  const last = data[data.length - 1];
 
-  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Bar chart of planetary Kp index, last ${data.length} three-hour intervals">
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Bar chart of planetary Kp index, last ${data.length} three-hour intervals. Latest value ${last.kp.toFixed(1)}, ${kpLevel(last.kp).label}.">
     <g class="grid">${[0, 3, 5, 7, 9].map((v) => `<line x1="${m.l}" x2="${w - m.r}" y1="${y(v)}" y2="${y(v)}" ${v === 5 ? 'stroke-dasharray="4 4" style="stroke:#ec835a;stroke-opacity:.6"' : ""}/>`).join("")}</g>
     <g class="axis">${[0, 3, 5, 7, 9].map((v) => `<text x="${m.l - 8}" y="${y(v) + 4}" text-anchor="end">${v}</text>`).join("")}
       ${dayTicks.map((t) => `<text x="${x(t)}" y="${h - 6}">${d3.utcFormat("%a %d")(new Date(t))}</text>`).join("")}
     </g>
     <g>${data.map((d, i) => `<path class="bar" data-i="${i}" d="${barPath(d)}" fill="${kpLevel(d.kp).color}"/>`).join("")}</g>
+    <text class="now-label" x="${x(+last.time) + bw / 2}" y="${y(Math.max(last.kp, 0.15)) - 6}" text-anchor="middle">now</text>
     <g>${data.map((d, i) => `<rect class="hit" data-i="${i}" x="${x(+d.time) - (x.step() - bw) / 2}" y="${m.t}" width="${x.step()}" height="${h - m.t - m.b}"/>`).join("")}</g>
   </svg><div class="tooltip" hidden></div>`;
 
@@ -782,7 +1304,7 @@ function renderKpChart() {
     el.classList.add("hovering");
     svg.querySelectorAll(".bar").forEach((b) => b.classList.toggle("on", b.dataset.i === i));
     const lvl = kpLevel(d.kp);
-    tip.innerHTML = `<strong>Kp ${d.kp.toFixed(2)}</strong><span class="status-pill" style="background:${lvl.color}">${lvl.label}</span><div class="muted">${d3.utcFormat("%a %d %b, %H:%M UTC")(d.time)}</div>`;
+    tip.innerHTML = `<strong>Kp ${d.kp.toFixed(2)} <span class="status-pill" style="background:${lvl.color}">${lvl.label}</span></strong><span class="muted">${d3.utcFormat("%a %d %b, %H:%M UTC")(d.time)}</span>`;
     tip.hidden = false;
     const r = el.getBoundingClientRect();
     const tx = e.clientX - r.left;
@@ -803,46 +1325,63 @@ async function fxGet(path) {
   throw lastErr;
 }
 
+const fxAmount = $("#fx-amount"), fxFrom = $("#fx-from"), fxTo = $("#fx-to");
+fxAmount.value = state.fxPref.amount;
+
 async function loadFx() {
   try {
     const [latest, names] = await Promise.all([fxGet("/latest?base=USD"), fxGet("/currencies").catch(() => ({}))]);
     state.fx = { rates: { USD: 1, ...latest.rates }, names, date: latest.date };
-    $("#fx-date").textContent = `ECB reference rates · ${latest.date}`;
+    state.failed.delete("fx");
+    const date = new Date(latest.date + "T12:00:00Z").toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+    $("#fx-date").textContent = `European Central Bank reference rates · ${date}`;
     const codes = Object.keys(state.fx.rates).sort();
-    const opts = codes.map((c) => `<option value="${c}" title="${esc(names[c] ?? c)}">${c}</option>`).join("");
-    const from = $("#fx-from").value || "USD", to = $("#fx-to").value || "EUR";
-    $("#fx-from").innerHTML = opts; $("#fx-to").innerHTML = opts;
-    $("#fx-from").value = codes.includes(from) ? from : "USD";
-    $("#fx-to").value = codes.includes(to) ? to : "EUR";
+    const opts = codes.map((c) => `<option value="${c}">${c}${names[c] ? ` — ${esc(names[c])}` : ""}</option>`).join("");
+    const from = fxFrom.value || state.fxPref.from, to = fxTo.value || state.fxPref.to;
+    fxFrom.innerHTML = opts; fxTo.innerHTML = opts;
+    fxFrom.value = codes.includes(from) ? from : "USD";
+    fxTo.value = codes.includes(to) ? to : "EUR";
     convert();
     if (state.selected) renderCountryFx(state.selected);
   } catch (err) {
-    $("#fx-result").innerHTML = `<span class="error-note" style="font-size:13px">Exchange rates unavailable (${esc(err.message)})</span>`;
+    state.failed.add("fx");
+    if (!state.fx.rates) $("#fx-result").innerHTML = errorBox(`Exchange rates are unavailable (${err.message}).`, "fx");
   }
 }
+
+const fmtMoney = (v, c) => {
+  try { return new Intl.NumberFormat(undefined, { style: "currency", currency: c, maximumFractionDigits: v !== 0 && Math.abs(v) < 1 ? 4 : 2 }).format(v); }
+  catch { return `${v.toFixed(2)} ${c}`; }
+};
 
 function convert() {
   const r = state.fx.rates;
   if (!r) return;
-  const amt = parseFloat($("#fx-amount").value) || 0;
-  const from = $("#fx-from").value, to = $("#fx-to").value;
-  const val = (amt * r[to]) / r[from];
-  const fmt = (v, c) => {
-    try { return new Intl.NumberFormat(undefined, { style: "currency", currency: c, maximumFractionDigits: v < 1 ? 4 : 2 }).format(v); }
-    catch { return `${v.toFixed(2)} ${c}`; }
-  };
-  $("#fx-result").innerHTML = `${fmt(val, to)}<small>${fmt(amt, from)}${state.fx.names[to] ? " → " + esc(state.fx.names[to]) : ""} · 1 ${from} = ${(r[to] / r[from]).toPrecision(5)} ${to}</small>`;
+  const amt = Math.max(0, parseFloat(fxAmount.value) || 0);
+  const from = fxFrom.value, to = fxTo.value;
+  const rate = r[to] / r[from];
+  const val = amt * rate;
+  $("#fx-from-name").textContent = state.fx.names[from] ?? from;
+  $("#fx-to-name").textContent = state.fx.names[to] ?? to;
+  // show only the code in the closed select; full names live in the option list + caption
+  for (const sel of [fxFrom, fxTo]) {
+    for (const o of sel.options) o.textContent = o.selected ? o.value : `${o.value}${state.fx.names[o.value] ? " — " + state.fx.names[o.value] : ""}`;
+  }
+  $("#fx-result").innerHTML = `${fmtMoney(val, to)}<small>for ${fmtMoney(amt, from)}</small><small>1 ${from} = ${fmtRate(rate)} ${to} · 1 ${to} = ${fmtRate(1 / rate)} ${from}</small>`;
   const popular = ["USD", "EUR", "GBP", "JPY", "CNY", "INR", "CAD", "AUD", "MXN", "BRL", "CHF"].filter((c) => c !== from && r[c]);
-  $("#fx-chips").innerHTML = popular.map((c) => `<button type="button" class="chip" data-to="${c}">${c} ${((amt * r[c]) / r[from]).toLocaleString(undefined, { maximumFractionDigits: 2 })}</button>`).join("");
+  $("#fx-chips").innerHTML = popular.map((c) =>
+    `<button type="button" class="chip${c === to ? " active" : ""}" data-to="${c}" aria-pressed="${c === to}" title="${esc(state.fx.names[c] ?? c)}"><b>${c}</b>${((amt * r[c]) / r[from]).toLocaleString(undefined, { maximumFractionDigits: 2 })}</button>`).join("");
+  state.fxPref = { from, to, amount: fxAmount.value };
+  savePrefs();
 }
-$("#fx-amount").addEventListener("input", convert);
-$("#fx-from").addEventListener("change", convert);
-$("#fx-to").addEventListener("change", convert);
+fxAmount.addEventListener("input", convert);
+fxFrom.addEventListener("change", convert);
+fxTo.addEventListener("change", convert);
 $("#fx-swap").addEventListener("click", () => {
-  const a = $("#fx-from").value; $("#fx-from").value = $("#fx-to").value; $("#fx-to").value = a; convert();
+  const a = fxFrom.value; fxFrom.value = fxTo.value; fxTo.value = a; convert();
 });
 $("#fx-chips").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-to]"); if (b) { $("#fx-to").value = b.dataset.to; convert(); }
+  const b = e.target.closest("[data-to]"); if (b) { fxTo.value = b.dataset.to; convert(); }
 });
 
 // ---------------------------------------------------------------------------
@@ -867,51 +1406,77 @@ async function worldBank(iso3) {
   return res;
 }
 
-async function selectCountry(f) {
+const countryPanel = $("#country-panel");
+
+function renderCountryEmpty() {
+  countryPanel.className = "country-empty";
+  const tries = TRY_COUNTRIES.map(([a3, a2]) =>
+    `<button type="button" class="try-chip" data-a3="${a3}">${flagEmoji(a2)} ${esc(regionNames?.of(a2) ?? a3)}</button>`).join("");
+  countryPanel.innerHTML = `
+    <div class="globe-art">${icon("globe")}</div>
+    <h3>Pick a country</h3>
+    <p>Click any country on the map, or search for one at the top, to see its population, economy, recent activity and exchange rate.</p>
+    <div class="try-list" aria-label="Suggestions">${tries}</div>`;
+}
+
+async function selectCountry(f, { fly = true } = {}) {
   state.selected = f;
   baseDirty = true;
+  $("#count-country").hidden = false;
   switchTab("country");
-  const centroid = d3.geoCentroid(f);
-  flyTo(centroid, Math.max(state.zoom, 1.3));
+  if (f.a3) history.replaceState(null, "", `#country=${f.a3}`);
+  if (fly) {
+    const { center, zoom } = countryFocus(f);
+    flyTo(center, zoom);
+  }
+  renderMapInfo();
 
-  const panel = $("#country-panel");
-  panel.className = "country";
-  panel.innerHTML = `
-    <div class="country-head"><span class="flag">${flagEmoji(f.a2)}</span><div><h3>${esc(f.name)}</h3><span class="muted small">${esc(f.a3 ?? "")}${f.currency ? " · " + esc(f.currency) : ""}</span></div>
-      <button class="btn ghost" id="country-close" style="margin-left:auto" aria-label="Clear selection">✕</button></div>
-    <div class="stat-grid" id="wb-grid">${INDICATORS.map((i) => `<div class="stat"><span>${i.label}</span><strong class="skeleton">000000</strong><em>&nbsp;</em></div>`).join("")}</div>
-    <div class="stat-grid" id="local-grid"></div>
+  countryPanel.className = "country";
+  countryPanel.innerHTML = `
+    <div class="country-head"><span class="flag">${flagEmoji(f.a2)}</span>
+      <div><h3>${esc(f.name)}</h3><span class="muted small">${esc(f.a3 ?? "")}${f.currency ? " · currency " + esc(f.currency) : ""}</span></div>
+      <div class="country-head-actions">
+        ${f.a3 ? `<button type="button" class="btn icon ghost" data-action="share" title="Copy a link to this country" aria-label="Copy link to this country">${icon("link")}</button>` : ""}
+        <button type="button" class="btn icon ghost" data-action="clear-country" title="Clear selection (Esc)" aria-label="Clear selection">${icon("x")}</button>
+      </div></div>
+    <div><div class="section-label">At a glance</div>
+      <div class="stat-grid" id="wb-grid">${INDICATORS.map((i) => `<div class="stat"><span>${i.label}</span><strong><span class="skeleton">000000</span></strong><em>&nbsp;</em></div>`).join("")}</div></div>
+    <div><div class="section-label">Live activity</div><div class="stat-grid" id="local-grid"></div><ul class="mini-list" id="local-list"></ul></div>
     <div id="country-fx"></div>
-    <p class="small muted" style="margin:0">Indicators: The World Bank, World Development Indicators (CC BY 4.0). Latest available year shown.</p>`;
-  $("#country-close").addEventListener("click", clearSelection);
+    <p class="attribution">Indicators: The World Bank, World Development Indicators (CC BY 4.0). Latest available year shown.</p>`;
+  $("#panel-country").scrollTop = 0;
   renderCountryLocalStats(f);
   renderCountryFx(f);
 
   if (!f.a3) {
-    $("#wb-grid").innerHTML = `<p class="muted small">No World Bank code for this territory.</p>`;
+    $("#wb-grid").innerHTML = `<p class="muted small">The World Bank has no data code for this territory.</p>`;
     return;
   }
   const res = await worldBank(f.a3);
   if (state.selected !== f) return;
   $("#wb-grid").innerHTML = res.every((r) => r.value == null)
-    ? `<p class="muted small">${res.some((r) => r.error) ? "World Bank API unreachable right now." : "The World Bank publishes no indicators for this territory."}</p>`
-    : res.map((r) => `<div class="stat"><span>${r.label}</span><strong>${r.value == null ? "—" : r.fmt(r.value)}</strong><em>${r.year ?? "n/a"}</em></div>`).join("");
+    ? (res.some((r) => r.error)
+      ? `<div class="stat wide">${errorBox("The World Bank API isn't responding right now.", "country")}</div>`
+      : `<p class="muted small">The World Bank publishes no indicators for this territory.</p>`)
+    : res.map((r) => `<div class="stat"><span>${r.label}</span><strong>${r.value == null ? "—" : r.fmt(r.value)}</strong><em>${r.year ? "as of " + r.year : "not available"}</em></div>`).join("");
 }
 
 function renderCountryLocalStats(f) {
   const grid = $("#local-grid");
   if (!grid) return;
-  const inside = (c) => {
-    const [[x0, y0], [x1, y1]] = f.bbox;
-    const inBox = x0 <= x1 ? c[0] >= x0 && c[0] <= x1 : c[0] >= x0 || c[0] <= x1;
-    return inBox && c[1] >= y0 && c[1] <= y1 && d3.geoContains(f, c);
-  };
-  const qs = state.quakes.filter((q) => inside(q.coord));
-  const evs = state.events.filter((e) => inside(e.coord));
+  const qs = state.quakes.filter((q) => inCountry(f, q.coord));
+  const evs = state.events.filter((e) => inCountry(f, e.coord));
   const big = qs[0];
   grid.innerHTML = `
-    <div class="stat"><span>Quakes in current feed</span><strong>${qs.length}</strong><em>${big ? "largest M" + big.mag.toFixed(1) : "on land / within borders"}</em></div>
-    <div class="stat"><span>Open natural events</span><strong>${evs.length}</strong><em>${evs.length ? esc([...new Set(evs.map((e) => e.cat.label))].join(", ")) : "none tracked"}</em></div>`;
+    <div class="stat"><span>Earthquakes</span><strong>${qs.length}</strong><em>${big ? "largest M" + big.mag.toFixed(1) : "on land, in this feed"}</em></div>
+    <div class="stat"><span>Natural events</span><strong>${evs.length}</strong><em>${evs.length ? esc([...new Set(evs.map((e) => e.cat.label))].join(", ")) : "none open"}</em></div>`;
+  const items = [
+    ...[...qs].sort((a, b) => b.time - a.time).slice(0, 4).map((q) =>
+      `<li data-kind="quake" data-id="${esc(q.id)}"><span class="mini-mag" style="color:${quakeColor(q.mag)}">M${q.mag.toFixed(1)}</span><span class="mini-text">${esc(q.place)}</span><span class="mini-time">${ago(q.time)}</span></li>`),
+    ...evs.slice(0, 4).map((e) =>
+      `<li data-kind="event" data-id="${esc(e.id)}">${symbolSVG(e.cat.symbol, e.cat.color, 60, 12)}<span class="mini-text">${esc(e.title)}</span><span class="mini-time">${ago(e.date)}</span></li>`),
+  ];
+  $("#local-list").innerHTML = items.join("");
 }
 
 function renderCountryFx(f) {
@@ -920,70 +1485,250 @@ function renderCountryFx(f) {
   const r = state.fx.rates;
   if (!f.currency || !r) { box.innerHTML = ""; return; }
   if (!r[f.currency]) {
-    box.innerHTML = `<div class="stat wide"><span>Currency</span><strong>${esc(f.currency)}</strong><em>Not in the ECB reference set</em></div>`;
+    box.innerHTML = `<div class="section-label">Currency</div><div class="stat wide"><span>Local currency</span><strong>${esc(f.currency)}</strong><em>Not in the ECB reference set, so no live rate</em></div>`;
     return;
   }
-  box.innerHTML = `<div class="stat wide"><span>Exchange rate (ECB, ${esc(state.fx.date)})</span><strong>1 USD = ${r[f.currency].toPrecision(5)} ${esc(f.currency)}</strong>
-    <button type="button" class="btn" id="use-fx" style="margin-top:8px">Use in converter</button></div>`;
-  $("#use-fx").addEventListener("click", () => {
-    $("#fx-to").value = f.currency; convert();
-    $(".fx-card").scrollIntoView({ behavior: "smooth", block: "center" });
-  });
+  const base = f.currency === "USD" ? "EUR" : "USD";
+  const rate = r[f.currency] / r[base];
+  box.innerHTML = `<div class="section-label">Currency</div><div class="stat wide"><span>Exchange rate (ECB, ${esc(state.fx.date)})</span><strong>1 ${base} = ${fmtRate(rate)} ${esc(f.currency)}</strong>
+    <button type="button" class="btn sm" data-action="use-fx" data-ccy="${esc(f.currency)}" data-base="${base}">${icon("cash")}Open in converter</button></div>`;
 }
 
 function clearSelection() {
+  if (!state.selected) return;
   state.selected = null;
   baseDirty = true;
-  const panel = $("#country-panel");
-  panel.className = "country-empty";
-  panel.innerHTML = `<p>Click any country on the map to see World Bank indicators and its live exchange rate.</p>`;
+  $("#count-country").hidden = true;
+  history.replaceState(null, "", location.pathname + location.search);
+  renderCountryEmpty();
+  renderMapInfo();
 }
+
+function applyHash() {
+  const m = location.hash.match(/country=([A-Za-z]{3})/);
+  if (!m || !state.geo) return;
+  const f = countryByA3(m[1].toUpperCase());
+  if (f && f !== state.selected) selectCountry(f);
+}
+window.addEventListener("hashchange", applyHash);
+
+async function shareCountry() {
+  const url = location.href;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast("Link copied. Anyone who opens it will see this country.");
+  } catch {
+    toast("Couldn't copy automatically. The link is in your address bar.", { tone: "warn" });
+  }
+}
+
+// one delegated handler for buttons rendered inside panels and the map card
+document.addEventListener("click", (e) => {
+  const a = e.target.closest("[data-action]");
+  if (a) {
+    switch (a.dataset.action) {
+      case "unpin": unpin(); break;
+      case "clear-country": clearSelection(); break;
+      case "share": shareCountry(); break;
+      case "country-details": switchTab("country"); $("#side").scrollIntoView({ behavior: smoothScroll, block: "start" }); break;
+      case "use-fx":
+        fxFrom.value = a.dataset.base; fxTo.value = a.dataset.ccy; convert();
+        $("#fx-card").scrollIntoView({ behavior: smoothScroll, block: "center" });
+        setTimeout(() => fxAmount.focus({ preventScroll: true }), 400);
+        break;
+    }
+    return;
+  }
+  const t = e.target.closest(".try-chip");
+  if (t) {
+    const f = countryByA3(t.dataset.a3);
+    if (f) selectCountry(f); else toast("Map data is still loading. Try again in a moment.", { tone: "warn" });
+    return;
+  }
+  const mini = e.target.closest(".mini-list li");
+  if (mini) {
+    const item = findItem(mini.dataset.kind, mini.dataset.id);
+    if (item) {
+      state.pinned = { kind: mini.dataset.kind, id: item.id };
+      flyTo(item.coord, Math.max(state.zoom, 3));
+      renderMapInfo();
+      if (singleColumn() && !inView(wrap, 0.6)) wrap.scrollIntoView({ behavior: smoothScroll, block: "center" });
+    }
+    return;
+  }
+  const r = e.target.closest("[data-retry]");
+  if (r) {
+    const which = r.dataset.retry;
+    r.disabled = true;
+    r.innerHTML = `<span class="spinner"></span>Retrying…`;
+    ({ quakes: loadQuakes, events: loadEvents, kp: loadKp, fx: loadFx, country: () => state.selected && selectCountry(state.selected, { fly: false }) })[which]?.();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // UI wiring
 // ---------------------------------------------------------------------------
-function switchTab(name) {
-  document.querySelectorAll(".tab").forEach((t) => {
+function switchTab(name, { focus = false } = {}) {
+  $$(".tab").forEach((t) => {
     const on = t.dataset.tab === name;
     t.classList.toggle("active", on);
     t.setAttribute("aria-selected", String(on));
+    t.tabIndex = on ? 0 : -1;
+    if (on && focus) t.focus();
   });
-  document.querySelectorAll(".tab-panel").forEach((p) => (p.hidden = p.id !== `panel-${name}`));
+  $$(".tab-panel").forEach((p) => (p.hidden = p.id !== `panel-${name}`));
 }
-document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => switchTab(t.dataset.tab)));
+$$(".tab").forEach((t) => t.addEventListener("click", () => switchTab(t.dataset.tab)));
+$(".tabs").addEventListener("keydown", (e) => {
+  const tabs = $$(".tab");
+  const i = tabs.findIndex((t) => t.classList.contains("active"));
+  const j = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+  if (j == null) return;
+  e.preventDefault();
+  switchTab(tabs[(j + tabs.length) % tabs.length].dataset.tab, { focus: true });
+});
 
-document.querySelectorAll("[data-proj]").forEach((b) =>
-  b.addEventListener("click", () => {
-    state.proj = b.dataset.proj;
-    state.zoom = 1; state.panY = 0;
-    if (state.proj === "flat") state.rotate[1] = 0;
-    document.querySelectorAll("[data-proj]").forEach((x) => x.classList.toggle("active", x === b));
-    markMoving();
-  }),
-);
-
-for (const k of ["quakes", "events", "night"]) {
-  $(`#layer-${k}`).addEventListener("change", (e) => { state.layers[k] = e.target.checked; baseDirty = true; });
+function revealSide() {
+  if (singleColumn() && !inView($("#side"), 0.5)) $("#side").scrollIntoView({ behavior: smoothScroll, block: "start" });
 }
 
-$("#quake-feed").addEventListener("change", (e) => { state.quakeFeed = e.target.value; loadQuakes(); });
+// headline cards
+$$("[data-kpi]").forEach((b) => b.addEventListener("click", () => {
+  switch (b.dataset.kpi) {
+    case "quakes": switchTab("quakes"); revealSide(); break;
+    case "events": switchTab("events"); revealSide(); break;
+    case "kp": $("#kp-card").scrollIntoView({ behavior: smoothScroll, block: "start" }); break;
+    case "strongest": {
+      const q = state.quakes[0];
+      if (!q) return;
+      if (!state.layers.quakes) setLayer("quakes", true);
+      pin("quake", q, { fly: true });
+      if (!inView(wrap, 0.6)) wrap.scrollIntoView({ behavior: smoothScroll, block: "center" });
+      break;
+    }
+  }
+}));
 
-const dialog = $("#sources-dialog");
-$("#sources-btn").addEventListener("click", () => dialog.showModal?.() ?? dialog.setAttribute("open", ""));
+function setProj(p) {
+  if (p === state.proj) return;
+  state.proj = p;
+  stopAnim();
+  state.zoom = 1; state.panY = 0;
+  state.rotate = [state.rotate[0], p === "flat" ? 0 : DEFAULT_TILT, 0];
+  $$("[data-proj]").forEach((x) => {
+    const on = x.dataset.proj === p;
+    x.classList.toggle("active", on);
+    x.setAttribute("aria-pressed", String(on));
+  });
+  renderRotateBtn();
+  markMoving();
+  savePrefs();
+}
+$$("[data-proj]").forEach((b) => b.addEventListener("click", () => setProj(b.dataset.proj)));
 
-async function refreshAll() {
+function setLayer(k, on) {
+  state.layers[k] = on;
+  $(`[data-layer="${k}"]`).setAttribute("aria-pressed", String(on));
+  baseDirty = true;
+  savePrefs();
+}
+$$("[data-layer]").forEach((b) => b.addEventListener("click", () => setLayer(b.dataset.layer, !state.layers[b.dataset.layer])));
+
+$("#quake-feed").addEventListener("change", (e) => {
+  state.quakeFeed = e.target.value;
+  savePrefs();
+  $("#quake-list").innerHTML = `<li class="empty"><span class="spinner"></span>Loading earthquakes…</li>`;
+  $("#kpi-quakes").innerHTML = `<span class="skeleton">000</span>`;
+  state.quakesLoaded = false;
+  loadQuakes();
+});
+
+// dialogs
+const helpDialog = $("#help-dialog"), sourcesDialog = $("#sources-dialog");
+const openDialog = (d) => (d.showModal ? d.showModal() : d.setAttribute("open", ""));
+const openHelp = () => openDialog(helpDialog);
+$("#help-btn").addEventListener("click", openHelp);
+$("#sources-btn").addEventListener("click", () => openDialog(sourcesDialog));
+$("#sources-btn-2").addEventListener("click", () => openDialog(sourcesDialog));
+for (const d of [helpDialog, sourcesDialog]) {
+  // click on the backdrop closes
+  d.addEventListener("click", (e) => { if (e.target === d) d.close(); });
+}
+
+// welcome banner (first visit)
+const intro = $("#intro");
+function dismissIntro() {
+  intro.hidden = true;
+  state.introDismissed = true;
+  savePrefs();
+}
+$("#intro-dismiss").addEventListener("click", dismissIntro);
+$("#intro-help").addEventListener("click", () => { dismissIntro(); openHelp(); });
+
+// global keyboard shortcuts
+document.addEventListener("keydown", (e) => {
+  if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (document.querySelector("dialog[open]")) return;
+  const typing = e.target.closest?.("input, select, textarea, [contenteditable='true']");
+  if (e.key === "Escape" && !typing) {
+    if (state.pinned) unpin();
+    else if (state.selected) clearSelection();
+    return;
+  }
+  if (typing) return;
+  const actions = {
+    "/": () => { searchInput.focus(); searchInput.select(); },
+    "?": openHelp,
+    g: () => setProj(state.proj === "globe" ? "flat" : "globe"),
+    "+": () => zoomBy(1.5), "=": () => zoomBy(1.5),
+    "-": () => zoomBy(1 / 1.5), _: () => zoomBy(1 / 1.5),
+    0: resetView,
+    p: () => toggleRotate(),
+    r: () => refreshAll({ manual: true }),
+    f: toggleFullscreen,
+  };
+  const fn = actions[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+  if (fn) { e.preventDefault(); fn(); }
+});
+
+// ---------------------------------------------------------------------------
+// Refresh + clock
+// ---------------------------------------------------------------------------
+let refreshing = false;
+async function refreshAll({ manual = false } = {}) {
+  if (refreshing) return;
+  refreshing = true;
   const btn = $("#refresh-btn");
   btn.classList.add("spinning");
+  btn.disabled = true;
   await Promise.allSettled([loadQuakes(), loadEvents(), loadKp()]);
   btn.classList.remove("spinning");
+  btn.disabled = false;
+  refreshing = false;
   state.lastRefresh = Date.now();
   baseDirty = true; // terminator moves too
+  updateLiveDot();
+  if (manual) {
+    const bad = ["quakes", "events", "kp"].filter((k) => state.failed.has(k));
+    if (bad.length) toast(`Updated, but ${bad.length === 3 ? "no feeds" : bad.length + " feed" + (bad.length > 1 ? "s" : "")} could be reached`, { tone: "warn" });
+    else toast("Live data updated");
+  }
+  tick();
 }
-$("#refresh-btn").addEventListener("click", refreshAll);
+$("#refresh-btn").addEventListener("click", () => refreshAll({ manual: true }));
+
+function updateLiveDot() {
+  const dot = $("#live-dot");
+  const offline = navigator.onLine === false;
+  const some = ["quakes", "events", "kp"].some((k) => state.failed.has(k));
+  dot.classList.toggle("offline", offline);
+  dot.classList.toggle("stale", !offline && some);
+  dot.parentElement.title = offline ? "You're offline" : some ? "Some live feeds couldn't be reached" : "Live · Coordinated Universal Time";
+}
 
 function tick() {
   const now = new Date();
-  $("#clock").textContent = now.toISOString().slice(11, 19) + " UTC";
+  $("#clock").textContent = now.toISOString().slice(11, 19);
   if (state.lastRefresh) {
     const left = Math.max(0, state.lastRefresh + REFRESH_MS - Date.now());
     const mm = Math.floor(left / 60000), ss = String(Math.floor((left % 60000) / 1000)).padStart(2, "0");
@@ -991,24 +1736,54 @@ function tick() {
   }
 }
 
+window.addEventListener("online", () => { updateLiveDot(); toast("Back online. Refreshing…"); refreshAll(); });
+window.addEventListener("offline", () => { updateLiveDot(); toast("You're offline. Showing the last data we received.", { tone: "warn", ms: 4000 }); });
+
 let resizeT;
-new ResizeObserver(() => {
+const ro = new ResizeObserver(() => {
   resize();
   clearTimeout(resizeT);
   resizeT = setTimeout(renderKpChart, 120);
-}).observe(document.body);
+});
+ro.observe(document.body);
+ro.observe(wrap);
 
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 (async function boot() {
+  // reflect remembered preferences in the UI
+  $("#quake-feed").value = state.quakeFeed;
+  $$("[data-proj]").forEach((x) => {
+    const on = x.dataset.proj === state.proj;
+    x.classList.toggle("active", on);
+    x.setAttribute("aria-pressed", String(on));
+  });
+  for (const k of Object.keys(state.layers)) $(`[data-layer="${k}"]`)?.setAttribute("aria-pressed", String(state.layers[k]));
+  $$("[data-sort]").forEach((x) => {
+    const on = x.dataset.sort === state.quakeSort;
+    x.classList.toggle("active", on);
+    x.setAttribute("aria-pressed", String(on));
+  });
+  intro.hidden = state.introDismissed;
+  if (isMac) $$(".mod-key").forEach((k) => (k.textContent = "⌘"));
+  renderRotateBtn();
+
   resize();
   renderLegend();
+  renderEventFilters();
+  renderCountryEmpty();
+  renderKpChart();
   requestAnimationFrame(frame);
   setInterval(tick, 1000);
   tick();
 
-  loadGeo().catch((e) => console.error("geo", e));
+  loadGeo()
+    .then(() => { $("#map-loading").classList.add("done"); applyHash(); if (searchInput.value.trim()) renderSearch(); })
+    .catch((e) => {
+      console.error("geo", e);
+      $("#map-loading").innerHTML = `${icon("alert")}<span>Couldn't load the map outlines. Reload the page to try again.</span>`;
+    });
   await Promise.allSettled([refreshAll(), loadFx()]);
   setInterval(refreshAll, REFRESH_MS);
   setInterval(loadFx, FX_REFRESH_MS);
