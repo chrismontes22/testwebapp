@@ -2,13 +2,16 @@
 
 A live dashboard of Earth, built only on **public-domain and permissively licensed open data**. Every source here allows commercial use. Nothing is copyleft or share-alike.
 
-- 🌍 **Interactive 3D globe or flat map.** Drag to spin, scroll or pinch to zoom, with live day/night shading.
-- 🌋 **Earthquakes** from USGS. Choose the feed: M2.5+ for the past day, M4.5+ for the past week, significant quakes for the past month, and more. Quakes from the last hour pulse on the map.
-- 🔥 **Natural events** from NASA EONET: wildfires, storms, volcanoes, sea ice and more. Each category has its own glyph, and you can toggle categories on and off.
-- 🧲 **Geomagnetic Kp index** from NOAA SWPC, with storm levels and an aurora outlook.
-- 🏳️ **Country panel.** Click a country to see World Bank indicators (population, GDP, life expectancy, internet use, renewables), its local quakes and events, and its live exchange rate.
-- 💱 **Currency converter** using European Central Bank reference rates (via Frankfurter).
-- 🔄 **Auto-refresh.** Live feeds update every 5 minutes, and FX rates update every hour.
+- 🌍 **Interactive 3D globe or flat map.** Drag to spin. Pinch, Ctrl/⌘ + scroll, or use the on-map +/− buttons to zoom. The map has live day/night shading, plus buttons to reset the view, pause rotation and go full screen. A plain mouse-wheel scroll moves the page, so you never get stuck on the map.
+- 🔎 **Country search** in the header (press <kbd>/</kbd>). It handles accents and common aliases such as "UK" and "USA", and zooms to fit the country you pick, even tiny ones.
+- 🌋 **Earthquakes** from USGS. Choose the feed: M2.5+ for the past day, M4.5+ for the past week, significant quakes for the past month, and more. Quakes from the last hour pulse on the map. You can sort the list by newest or strongest, and each quake gets a plain-language size label ("Light", "Strong", "Major").
+- 🔥 **Natural events** from NASA EONET: wildfires, storms, volcanoes, sea ice and more. Each category has its own glyph, and you can filter categories from the legend or the Events tab.
+- 📌 **Click anything.** Clicking a marker pins a detail card on the map and highlights it in the list. Clicking a list item flies the map to it. The headline cards are shortcuts, for example to fly to the strongest quake.
+- 🧲 **Geomagnetic Kp index** from NOAA SWPC, with a plain-English explanation, storm levels and an aurora outlook.
+- 🏳️ **Country panel.** Click or search for a country to see World Bank indicators (population, GDP, life expectancy, internet use, renewables), its local quakes and events, and its live exchange rate. The page address updates (`#country=JPN`), so you can share a link.
+- 💱 **Currency converter** using European Central Bank reference rates (via Frankfurter), with full currency names and one-tap quick conversions.
+- 🙋 **Friendly by default.** There's a first-visit welcome, a help dialog (<kbd>?</kbd>), keyboard shortcuts, and "Try again" buttons when a feed is down. Your settings (map style, layers, filters, currencies) are remembered in local storage, and the app respects reduced-motion preferences.
+- 🔄 **Auto-refresh.** Live feeds update every 5 minutes, and FX rates update every hour. The live dot turns amber if a feed can't be reached.
 
 No backend, no API keys, no build step. It's a static site that calls free public APIs from the browser.
 
@@ -54,8 +57,8 @@ npm install && npm run build:data
 ```
 public/
   index.html          markup
-  css/styles.css      styling (dark, glassy, responsive)
-  js/app.js           map rendering, API calls, UI
+  css/styles.css      styling (dark, glassy, responsive; colour tokens on :root)
+  js/app.js           map rendering, API calls, search, UI + keyboard shortcuts
   data/               Natural Earth TopoJSON + country/currency codes
   vendor/             d3, topojson-client, license notices
 scripts/build-data.mjs  regenerates public/data and public/vendor
