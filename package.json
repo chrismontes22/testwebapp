@@ -1,0 +1,19 @@
+{
+  "name": "planet-pulse",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live Earth dashboard built only on public-domain and permissively licensed data.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build:data": "node scripts/build-data.mjs",
+    "start": "npx --yes http-server@14.1.1 public -p 8080 -c-1"
+  },
+  "devDependencies": {
+    "country-to-currency": "3.0.2",
+    "d3": "7.9.0",
+    "i18n-iso-countries": "7.14.0",
+    "topojson-client": "3.1.0",
+    "world-atlas": "2.0.2"
+  }
+}

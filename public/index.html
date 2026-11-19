@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Planet Pulse</title>
+  <meta name="description" content="A live dashboard of Earth: earthquakes, natural events, geomagnetic activity, country indicators and exchange rates — all from public-domain and permissively licensed open data." />
+  <meta name="theme-color" content="#070b16" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='%230f1a33' stroke='%235aa2ff' stroke-width='4'/%3E%3Cpath d='M8 34h12l5-12 8 22 6-14 4 4h13' fill='none' stroke='%23ff7a6b' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <div class="stars" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 64 64" width="30" height="30" aria-hidden="true"><circle cx="32" cy="32" r="26" fill="#0f1a33" stroke="#5aa2ff" stroke-width="4"/><path d="M8 34h12l5-12 8 22 6-14 4 4h13" fill="none" stroke="#ff7a6b" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div>
+        <h1>Planet Pulse</h1>
+        <p class="tagline">Earth, live — from open data</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="live"><span class="live-dot"></span><span id="clock">--:--:-- UTC</span></span>
+      <span class="refresh" id="refresh-status" title="Data refreshes automatically">Loading…</span>
+      <button class="btn ghost" id="refresh-btn" type="button" title="Refresh now" aria-label="Refresh data now">
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="btn ghost" id="sources-btn" type="button">Sources &amp; licenses</button>
+    </div>
+  </header>
+
+  <section class="kpis" aria-label="Headline numbers">
+    <article class="kpi">
+      <span class="kpi-label">Earthquakes</span>
+      <strong class="kpi-value" id="kpi-quakes">—</strong>
+      <span class="kpi-sub" id="kpi-quakes-sub">loading USGS feed</span>
+    </article>
+    <article class="kpi">
+      <span class="kpi-label">Strongest</span>
+      <strong class="kpi-value" id="kpi-strongest">—</strong>
+      <span class="kpi-sub" id="kpi-strongest-sub">&nbsp;</span>
+    </article>
+    <article class="kpi">
+      <span class="kpi-label">Active natural events</span>
+      <strong class="kpi-value" id="kpi-events">—</strong>
+      <span class="kpi-sub" id="kpi-events-sub">loading NASA EONET</span>
+    </article>
+    <article class="kpi">
+      <span class="kpi-label">Geomagnetic Kp</span>
+      <strong class="kpi-value" id="kpi-kp">—</strong>
+      <span class="kpi-sub" id="kpi-kp-sub">loading NOAA SWPC</span>
+    </article>
+  </section>
+
+  <main class="layout">
+    <section class="map-card card" aria-label="Interactive world map">
+      <div class="map-toolbar">
+        <div class="seg" role="group" aria-label="Projection">
+          <button type="button" class="seg-btn active" data-proj="globe">Globe</button>
+          <button type="button" class="seg-btn" data-proj="flat">Flat</button>
+        </div>
+        <div class="seg" role="group" aria-label="Earthquake feed">
+          <select id="quake-feed" aria-label="Earthquake filter">
+            <option value="2.5_day">M2.5+ · past day</option>
+            <option value="all_day">All · past day</option>
+            <option value="4.5_week">M4.5+ · past week</option>
+            <option value="2.5_week">M2.5+ · past week</option>
+            <option value="significant_month">Significant · past month</option>
+          </select>
+        </div>
+        <div class="layer-toggles" role="group" aria-label="Map layers">
+          <label><input type="checkbox" id="layer-quakes" checked /> Quakes</label>
+          <label><input type="checkbox" id="layer-events" checked /> Events</label>
+          <label><input type="checkbox" id="layer-night" checked /> Day/night</label>
+        </div>
+      </div>
+      <div class="map-wrap" id="map-wrap">
+        <canvas id="map" aria-label="World map with earthquakes and natural events. Click a country for details."></canvas>
+        <div class="tooltip" id="tooltip" role="status" hidden></div>
+        <div class="map-hint" id="map-hint">Drag to spin · scroll to zoom · click a country</div>
+      </div>
+      <div class="legend" id="legend" aria-label="Map legend"></div>
+    </section>
+
+    <aside class="side card" aria-label="Details">
+      <div class="tabs" role="tablist">
+        <button role="tab" class="tab active" aria-selected="true" data-tab="quakes">Quakes</button>
+        <button role="tab" class="tab" aria-selected="false" data-tab="events">Events</button>
+        <button role="tab" class="tab" aria-selected="false" data-tab="country">Country</button>
+      </div>
+      <div class="tab-panel" id="panel-quakes" role="tabpanel">
+        <ul class="feed" id="quake-list"><li class="empty">Loading…</li></ul>
+      </div>
+      <div class="tab-panel" id="panel-events" role="tabpanel" hidden>
+        <ul class="feed" id="event-list"><li class="empty">Loading…</li></ul>
+      </div>
+      <div class="tab-panel" id="panel-country" role="tabpanel" hidden>
+        <div id="country-panel" class="country-empty">
+          <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12h18M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+          <p>Click any country on the map to see World Bank indicators and its live exchange rate.</p>
+        </div>
+      </div>
+    </aside>
+
+    <section class="card kp-card" aria-labelledby="kp-title">
+      <div class="card-head">
+        <h2 id="kp-title">Planetary Kp index · last 3 days</h2>
+        <span class="muted small">3-hour intervals · NOAA SWPC</span>
+      </div>
+      <div class="kp-legend" id="kp-legend"></div>
+      <div class="kp-chart" id="kp-chart"></div>
+      <details class="table-view">
+        <summary>Show as table</summary>
+        <div class="table-scroll"><table id="kp-table"><thead><tr><th>Time (UTC)</th><th>Kp</th><th>Level</th></tr></thead><tbody></tbody></table></div>
+      </details>
+    </section>
+
+    <section class="card fx-card" aria-labelledby="fx-title">
+      <div class="card-head">
+        <h2 id="fx-title">Currency converter</h2>
+        <span class="muted small" id="fx-date">ECB reference rates</span>
+      </div>
+      <form class="fx-form" id="fx-form" onsubmit="return false">
+        <label class="fx-amount">
+          <span>Amount</span>
+          <input id="fx-amount" type="number" inputmode="decimal" min="0" step="any" value="100" />
+        </label>
+        <label>
+          <span>From</span>
+          <select id="fx-from"></select>
+        </label>
+        <button type="button" class="btn swap" id="fx-swap" aria-label="Swap currencies">⇄</button>
+        <label>
+          <span>To</span>
+          <select id="fx-to"></select>
+        </label>
+      </form>
+      <div class="fx-result" id="fx-result" aria-live="polite">—</div>
+      <div class="fx-chips" id="fx-chips"></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>
+      Data: <a href="https://earthquake.usgs.gov/" target="_blank" rel="noopener">USGS</a> (public domain) ·
+      <a href="https://eonet.gsfc.nasa.gov/" target="_blank" rel="noopener">NASA EONET</a> (public domain) ·
+      <a href="https://www.swpc.noaa.gov/" target="_blank" rel="noopener">NOAA SWPC</a> (public domain) ·
+      <a href="https://data.worldbank.org/" target="_blank" rel="noopener">The World Bank</a> (CC BY 4.0) ·
+      Exchange rates: <a href="https://www.ecb.europa.eu/" target="_blank" rel="noopener">European Central Bank</a> via <a href="https://frankfurter.dev/" target="_blank" rel="noopener">Frankfurter</a> ·
+      Map: <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a> (public domain).
+    </p>
+    <p class="muted small">Information only — not for safety-critical decisions. Boundaries are illustrative and imply no endorsement.</p>
+  </footer>
+
+  <dialog id="sources-dialog" class="dialog">
+    <form method="dialog">
+      <h2>Sources &amp; licenses</h2>
+      <p class="muted">Every data source and library here allows commercial use. Nothing is copyleft or share-alike.</p>
+      <table class="lic-table">
+        <thead><tr><th>Source</th><th>Used for</th><th>License</th><th>Updates</th></tr></thead>
+        <tbody>
+          <tr><td>USGS Earthquake Hazards Program</td><td>Earthquakes</td><td>Public domain (US Government work)</td><td>Live API · every minute</td></tr>
+          <tr><td>NASA EONET v3</td><td>Wildfires, storms, volcanoes, ice…</td><td>Public domain (NASA)</td><td>Live API</td></tr>
+          <tr><td>NOAA Space Weather Prediction Center</td><td>Planetary Kp index</td><td>Public domain (US Government work)</td><td>Live API · 3-hourly</td></tr>
+          <tr><td>World Bank Open Data</td><td>Country indicators</td><td>CC BY 4.0 — attribution required</td><td>Live API · yearly data</td></tr>
+          <tr><td>European Central Bank via Frankfurter</td><td>Exchange rates</td><td>ECB: free reuse with source credit · Frankfurter: MIT</td><td>Live API · each working day</td></tr>
+          <tr><td>Natural Earth via world-atlas</td><td>Country shapes</td><td>Public domain · world-atlas: ISC</td><td>Static (bundled)</td></tr>
+          <tr><td>D3, topojson-client</td><td>Rendering</td><td>ISC</td><td>Bundled</td></tr>
+          <tr><td>i18n-iso-countries, country-to-currency</td><td>Country/currency codes (build time)</td><td>MIT</td><td>Bundled</td></tr>
+        </tbody>
+      </table>
+      <p class="small muted">Full notices: <a href="vendor/THIRD_PARTY_LICENSES.txt" target="_blank">THIRD_PARTY_LICENSES.txt</a>. Keep the footer credits in place if you deploy this — the CC BY and ECB terms require attribution.</p>
+      <div class="dialog-actions"><button class="btn" value="close">Close</button></div>
+    </form>
+  </dialog>
+
+  <script src="vendor/d3.min.js"></script>
+  <script src="vendor/topojson-client.min.js"></script>
+  <script src="js/app.js" type="module"></script>
+</body>
+</html>
